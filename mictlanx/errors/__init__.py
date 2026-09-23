@@ -159,6 +159,21 @@ class IntegrityError(MictlanXError):
     def __init__(self, message = "Integrity check failed",status_code:int = 501,error_code:int = 501):
         super().__init__(message, status_code, error_code)
 
+class FilterError(MictlanXError):
+    """Exception raised for the IO-filter pipeline (put()/get() ``filters=``) error family (HTTP 500)."""
+    def __init__(self, message = "Filter pipeline error",status_code:int = 500,error_code:int = 506):
+        super().__init__(message, status_code, error_code)
+
+class FilterMismatchError(FilterError):
+    """Exception raised when get()'s filters don't match what was recorded at put() time (HTTP 422)."""
+    def __init__(self, message = "Filter mismatch",status_code:int = 422,error_code:int = 504):
+        super().__init__(message, status_code, error_code)
+
+class FilterExecutionError(FilterError):
+    """Exception raised when a filter's filter() call itself fails (bad key, tampered ciphertext, decompression error, missing optional dependency) (HTTP 500)."""
+    def __init__(self, message = "Filter execution failed",status_code:int = 500,error_code:int = 505):
+        super().__init__(message, status_code, error_code)
+
 class UnknownError(MictlanXError):
     """Catch-all exception for unmapped error codes (HTTP 500)."""
     def __init__(self, message = "An unknown error occurred",status_code:int = 500,error_code:int = 500):

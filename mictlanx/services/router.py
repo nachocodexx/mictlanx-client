@@ -273,12 +273,12 @@ class AsyncRouter:
                 return Ok(ResponseModels.DeletedByBallIdResponse.model_validate(content_data))
         except Exception as e:
             return Err(e)
-    async def get_chunks_metadata(self, key: str, bucket_id: str = "", timeout: int = 120, headers: Dict[str, str] = {},verify:VerifyType = False) -> Result[ResponseModels.BallMetadata, Exception]:
+    async def get_chunks_metadata(self, ball_id: str, bucket_id: str, timeout: int = 120, headers: Dict[str, str] = {},verify:VerifyType = False) -> Result[ResponseModels.BallMetadata, Exception]:
         """Retrieve aggregated chunk metadata for a ball via the router.
 
         Args:
-            key: Ball or chunk key to query.
-            bucket_id: Bucket containing the ball. Defaults to ``""``.
+            ball_id: Ball identifier to query.
+            bucket_id: Bucket containing the ball.
             timeout: Request timeout in seconds. Defaults to ``120``.
             headers: Additional HTTP headers.
             verify: SSL verification option. Defaults to ``False``.
@@ -287,7 +287,7 @@ class AsyncRouter:
             ``Ok(BallMetadata)`` on success, ``Err(Exception)`` on failure.
         """
         try:
-            url = f"{self.base_url()}/api/v{self.api_version}/buckets/{bucket_id}/metadata/{key}/chunks"
+            url = f"{self.base_url()}/api/v{self.api_version}/buckets/{bucket_id}/metadata/{ball_id}/chunks"
             async with httpx.AsyncClient(timeout=timeout,verify=verify) as client:
                 response = await client.get(url, headers=headers)
                 response.raise_for_status()

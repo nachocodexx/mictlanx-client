@@ -3,6 +3,7 @@ from typing import List, Dict, Optional, Tuple, AsyncGenerator
 import time as T
 from datetime import datetime
 import asyncio
+import functools
 from uuid import uuid4
 import httpx
 import mictlanx.interfaces as InterfaceX
@@ -22,6 +23,8 @@ from mictlanx.retry import raf, RetryPolicy
 from mictlanx.services import AsyncRouter
 from mictlanx.types import VerifyType
 from mictlanx.asyncx.bulk import _BulkJob
+from mictlanx.auth import AuthorizationService
+from mictlanx.filters import IOFilter
 
 try:
     from tqdm import tqdm
@@ -33,6 +36,28 @@ except ImportError:
         def close(self): pass
         def __enter__(self): return self
         def __exit__(self, *a): pass
+
+
+def _require_auth(fn):
+    """Ensure the client is authenticated before running a public method.
+
+    When ``self.authz`` is ``None`` (the default) this is a no-op passthrough.
+    Otherwise it calls :meth:`AsyncClient._ensure_authenticated` first; a
+    failure there short-circuits the call and returns ``Err(...)`` without
+    ever invoking ``fn``.
+    """
+    @functools.wraps(fn)
+    async def wrapper(self: "AsyncClient", *args, **kwargs):
+        try:
+            await self._ensure_authenticated()
+        except Exception as e:
+            # Preserve the original error type (e.g. AuthenticationError) —
+            # from_exception() only maps by error_code and would otherwise
+            # collapse an already-typed MictlanXError into UnknownError.
+            _e = e if isinstance(e, EX.MictlanXError) else EX.MictlanXError.from_exception(e)
+            return Err(_e)
+        return await fn(self, *args, **kwargs)
+    return wrapper
 
 
 class AsyncClient():
@@ -59,6 +84,7 @@ class AsyncClient():
             use_rich: bool | None = None,
             log_level: int | None = None,
             error_log: bool | None = None,
+            authz: Optional[AuthorizationService] = None,
     ):
         """Initialise the client and connect it to one or more routers.
 
@@ -102,6 +128,11 @@ class AsyncClient():
                 env var.
             log_level: Minimum log level (e.g. ``logging.INFO``). Defaults to
                 the ``MICTLANX_LOG_LEVEL`` env var (``DEBUG`` if unset).
+            authz: Optional :class:`~mictlanx.auth.AuthorizationService`.
+                When ``None`` (the default) no authorization checks are
+                performed — current behaviour is unchanged. When set, the
+                client authenticates lazily on the first public method call
+                and re-verifies before every subsequent call.
         """
         _bool = lambda v: v.lower() in ("1", "true", "yes")
 
@@ -141,8 +172,42 @@ class AsyncClient():
         max_workers      = os.cpu_count() if max_workers > os.cpu_count() else max_workers
         self.bulk_jobs: Dict[str, _BulkJob] = {}
         self.bulk_jobs_lock = asyncio.Lock()
+        self.authz = authz
+        self._auth_lock = asyncio.Lock()
+
+    async def _ensure_authenticated(self):
+        """Authenticate ``self.authz`` if needed, or raise if that fails.
+
+        No-op when ``self.authz`` is ``None``. Otherwise: a cheap
+        :meth:`~mictlanx.auth.AuthorizationService.verify` check first; only
+        if that fails does it acquire ``self._auth_lock`` and call
+        :meth:`~mictlanx.auth.AuthorizationService.authenticate`. The lock is
+        re-checked with a second ``verify`` after acquisition so that a burst
+        of concurrent callers (e.g. ``put_bulk``'s per-item tasks) triggers
+        at most one ``authenticate`` call, not one per caller.
+        """
+        if self.authz is None:
+            return
+        result = await self.authz.verify()
+        if result.is_ok:
+            return
+        async with self._auth_lock:
+            result = await self.authz.verify()
+            if result.is_ok:
+                return
+            auth_result = await self.authz.authenticate()
+            if auth_result.is_err:
+                _e = auth_result.unwrap_err()
+                self.__log.error({
+                    "event": "AUTHZ.AUTHENTICATE.FAILED",
+                    "message": _e.message,
+                    "error_type": type(_e).__name__,
+                    "status_code": _e.status_code,
+                })
+                raise _e
     # PUT METHODS
-    async def put_chunks(self,bucket_id:str, key:str, chunks:Chunks, tags:Dict[str,str]={}, rf:int =1, timeout:int=120, max_tries:int=5, max_concurrency:int=2,max_backoff:int = 5)->Result[bool, EX.MictlanXError]:
+    @_require_auth
+    async def put_chunks(self,bucket_id:str, ball_id:str, chunks:Chunks, tags:Dict[str,str]={}, rf:int =1, timeout:int=120, max_tries:int=5, max_concurrency:int=2,max_backoff:int = 5)->Result[bool, EX.MictlanXError]:
         """Upload a pre-chunked :class:`Chunks` object to a bucket.
 
         Computes an overall SHA-256 checksum from the chunk stream, then
@@ -151,7 +216,7 @@ class AsyncClient():
 
         Args:
             bucket_id: Destination bucket identifier.
-            key: Ball identifier used as the ``ball_id`` and chunk key prefix.
+            ball_id: Ball identifier used as the chunk key prefix.
             chunks: :class:`Chunks` object whose chunks are uploaded.
             tags: Extra metadata tags stored alongside each chunk.
             rf: Replication factor for each chunk. Defaults to ``1``.
@@ -168,7 +233,7 @@ class AsyncClient():
         try:
             t1         = T.monotonic()
             _bucket_id = Utils.sanitize_str(bucket_id)
-            _key       = Utils.sanitize_str(key)
+            _ball_id   = Utils.sanitize_str(ball_id)
             router     = self.rlb.get_router()
             gen_bytes  = chunks.to_generator()
 
@@ -178,7 +243,7 @@ class AsyncClient():
 
             _input = {
                 "bucket_id": bucket_id,
-                "ball_id": key,
+                "ball_id": ball_id,
                 "rf": rf,
                 "timeout": timeout,
                 "max_tries": max_tries,
@@ -197,20 +262,20 @@ class AsyncClient():
                             res = await AsyncClientUtils.put_chunk(
                                 router=router,
                                 client_id=self.client_id,
-                                ball_id=key,
+                                ball_id=_ball_id,
                                 bucket_id=_bucket_id,
                                 key=chunk.chunk_id,
                                 chunk=chunk,
                                 rf=rf,
                                 timeout=timeout,
-                                metadata={"num_chunks": str(num_chunks), "full_checksum": checksum, **tags},
+                                metadata={**tags, "num_chunks": str(num_chunks), "full_checksum": checksum},
                             )
                         if res.is_ok:
                             self.__log.debug({
                                 "event": "PUT.CHUNK",
                                 "message": "chunk uploaded",
                                 "bucket_id": _bucket_id,
-                                "ball_id": key,
+                                "ball_id": _ball_id,
                                 "key": chunk.chunk_id,
                                 "ok": True,
                                 "response_time_ms": round((T.monotonic() - chunk_t) * 1000, 2),
@@ -228,7 +293,7 @@ class AsyncClient():
                             "event": "PUT.CHUNK.RETRY",
                             "message": f"chunk upload failed on attempt {attempt}/{max_tries}",
                             "bucket_id": _bucket_id,
-                            "ball_id": key,
+                            "ball_id": _ball_id,
                             "key": chunk.chunk_id,
                             "function": "upload_chunk",
                             "error_type": type(e).__name__,
@@ -253,8 +318,7 @@ class AsyncClient():
                 "event": "PUT",
                 "message": "put completed",
                 "bucket_id": _bucket_id,
-                "ball_id": key,
-                "key": _key,
+                "ball_id": _ball_id,
                 "router": router.router_id,
                 "response_time_ms": round((T.monotonic() - t1) * 1000, 2),
                 "input": _input,
@@ -269,8 +333,7 @@ class AsyncClient():
                     "event": "MAX.AVAILABILITY.REACHED",
                     "message": "no peers available",
                     "bucket_id": bucket_id,
-                    "ball_id": key,
-                    "key": key,
+                    "ball_id": ball_id,
                     "function": "put_chunks",
                     "error_type": type(_e).__name__,
                     "input": _input,
@@ -281,8 +344,7 @@ class AsyncClient():
                 "event": "PUT.ERROR",
                 "message": _e.message,
                 "bucket_id": bucket_id,
-                "ball_id": key,
-                "key": key,
+                "ball_id": ball_id,
                 "function": "put_chunks",
                 "error_type": type(_e).__name__,
                 "status_code": _e.status_code,
@@ -291,7 +353,8 @@ class AsyncClient():
             })
             return Err(e)
     
-    async def put_file(self,bucket_id:str, key:str, path:str, tags:Dict[str,str]={}, chunk_size:str="256kb", rf:int =1, timeout:int=120, max_tries:int=5, max_concurrency:int=2,max_backoff:int =5)->Result[bool, EX.MictlanXError]:
+    @_require_auth
+    async def put_file(self,bucket_id:str, ball_id:str, path:str, tags:Dict[str,str]={}, chunk_size:str="256kb", rf:int =1, timeout:int=120, max_tries:int=5, max_concurrency:int=2,max_backoff:int =5)->Result[bool, EX.MictlanXError]:
         """Upload a file from disk by splitting it into chunks.
 
         Reads ``path`` from the filesystem, splits it into ``chunk_size``
@@ -299,7 +362,7 @@ class AsyncClient():
 
         Args:
             bucket_id: Destination bucket identifier.
-            key: Ball identifier used as the ``ball_id`` and chunk key prefix.
+            ball_id: Ball identifier used as the chunk key prefix.
             path: Absolute or relative path to the file to upload.
             tags: Extra metadata tags stored alongside each chunk.
             chunk_size: Humanfriendly size string (e.g. ``"256kb"``, ``"4MB"``).
@@ -320,12 +383,12 @@ class AsyncClient():
         try:
             t1          = T.monotonic()
             _bucket_id  = Utils.sanitize_str(bucket_id)
-            _key        = Utils.sanitize_str(key)
+            _ball_id    = Utils.sanitize_str(ball_id)
             router      = self.rlb.get_router()
             _chunk_size = HF.parse_size(chunk_size)
             (_, checksum, size) = XoloUtils.extract_path_sha256_size(path=path)
 
-            op_chunks = Chunks.from_file(path=path, group_id=key, chunk_size=Some(_chunk_size))
+            op_chunks = Chunks.from_file(path=path, group_id=ball_id, chunk_size=Some(_chunk_size))
             if op_chunks.is_none:
                 raise EX.UnknownError(message=f"Failed to read the file: {path}")
             chunks = op_chunks.unwrap()
@@ -334,7 +397,7 @@ class AsyncClient():
 
             _input = {
                 "bucket_id": bucket_id,
-                "ball_id": key,
+                "ball_id": ball_id,
                 "path": path,
                 "chunk_size": chunk_size,
                 "rf": rf,
@@ -355,20 +418,20 @@ class AsyncClient():
                             res = await AsyncClientUtils.put_chunk(
                                 router=router,
                                 client_id=self.client_id,
-                                ball_id=key,
+                                ball_id=_ball_id,
                                 bucket_id=_bucket_id,
                                 key=chunk.chunk_id,
                                 chunk=chunk,
                                 rf=rf,
                                 timeout=timeout,
-                                metadata={"num_chunks": str(num_chunks), "full_checksum": checksum, **tags},
+                                metadata={**tags, "num_chunks": str(num_chunks), "full_checksum": checksum},
                             )
                         if res.is_ok:
                             self.__log.debug({
                                 "event": "PUT.CHUNK",
                                 "message": "chunk uploaded",
                                 "bucket_id": _bucket_id,
-                                "ball_id": key,
+                                "ball_id": _ball_id,
                                 "key": chunk.chunk_id,
                                 "ok": True,
                                 "response_time_ms": round((T.monotonic() - chunk_t) * 1000, 2),
@@ -385,7 +448,7 @@ class AsyncClient():
                             "event": "PUT.CHUNK.RETRY",
                             "message": f"chunk upload failed on attempt {attempt}/{max_tries}",
                             "bucket_id": _bucket_id,
-                            "ball_id": key,
+                            "ball_id": _ball_id,
                             "key": chunk.chunk_id,
                             "function": "upload_chunk",
                             "error_type": type(e).__name__,
@@ -410,8 +473,7 @@ class AsyncClient():
                 "event": "PUT",
                 "message": "put completed",
                 "bucket_id": _bucket_id,
-                "ball_id": key,
-                "key": _key,
+                "ball_id": _ball_id,
                 "router": router.router_id,
                 "response_time_ms": round((T.monotonic() - t1) * 1000, 2),
                 "input": _input,
@@ -426,8 +488,7 @@ class AsyncClient():
                     "event": "MAX.AVAILABILITY.REACHED",
                     "message": "no peers available",
                     "bucket_id": bucket_id,
-                    "ball_id": key,
-                    "key": key,
+                    "ball_id": ball_id,
                     "function": "put_file",
                     "error_type": type(_e).__name__,
                     "input": _input,
@@ -438,8 +499,7 @@ class AsyncClient():
                 "event": "PUT.ERROR",
                 "message": _e.message,
                 "bucket_id": bucket_id,
-                "ball_id": key,
-                "key": key,
+                "ball_id": ball_id,
                 "function": "put_file",
                 "error_type": type(_e).__name__,
                 "status_code": _e.status_code,
@@ -449,7 +509,8 @@ class AsyncClient():
             return Err(e)
         
 
-    async def put(self, bucket_id: str, key: str, value: bytes,ball_id:Optional[str]=None, chunk_size: str = "256kb", rf: int = 1, timeout: int = 120,max_tries:int = 5,max_concurrency:int =10,max_backoff:int=5,tags:Dict[str,str]={})->Result[bool,EX.MictlanXError]:
+    @_require_auth
+    async def put(self, bucket_id: str, ball_id: str, value: bytes, chunk_size: str = "256kb", rf: int = 1, timeout: int = 120,max_tries:int = 5,max_concurrency:int =10,max_backoff:int=5,tags:Dict[str,str]={},filters:Optional[List[IOFilter]]=None)->Result[bool,EX.MictlanXError]:
         """Upload raw bytes to a bucket by splitting them into chunks.
 
         Splits ``value`` into ``chunk_size`` chunks, computes a SHA-256
@@ -458,7 +519,7 @@ class AsyncClient():
 
         Args:
             bucket_id: Destination bucket identifier.
-            key: Ball identifier used as the ``ball_id`` and chunk key prefix.
+            ball_id: Ball identifier used as the chunk key prefix.
             value: Raw bytes to upload.
             chunk_size: Humanfriendly size string (e.g. ``"256kb"``).
                 Defaults to ``"256kb"``.
@@ -468,6 +529,14 @@ class AsyncClient():
             max_concurrency: Maximum simultaneous chunk uploads. Defaults to ``10``.
             max_backoff: Cap on exponential-backoff sleep in seconds. Defaults to ``5``.
             tags: Extra metadata tags stored alongside each chunk.
+            filters: Ordered list of :class:`~mictlanx.filters.IOFilter`
+                transforms applied to ``value`` before chunking (e.g.
+                ``[EncryptFilter(key), CompressFilter()]``). Defaults to
+                ``None`` (no filters — identical to today's behavior). The
+                checksum and the ``mictlanx_filters`` provenance tag are
+                computed from the filtered bytes; :meth:`get` must be given
+                the correctly-ordered inverse chain to recover the original
+                bytes.
 
         Returns:
             ``Ok(True)`` on success, ``Ok(False)`` when max-availability is
@@ -476,19 +545,17 @@ class AsyncClient():
         try:
             t1         = T.monotonic()
             _bucket_id = Utils.sanitize_str(bucket_id)
-            if ball_id is not None:
-                _key = Utils.sanitize_str(ball_id)
-            elif key is not None:
-                _key = Utils.sanitize_str(key)
-            else:
-                return Err(EX.BadParametersError(message="Either 'key' or 'ball_id' must be provided."))
-                # rrValueError("Either 'key' or 'ball_id' must be provided.")
+            _ball_id   = Utils.sanitize_str(ball_id)
 
-            # _key       = Utils.sanitize_str(key) if ball_id is None else Utils.sanitize_str(ball_id)
-
+            _filters = filters or []
+            for f in _filters:
+                try:
+                    value = f.filter(value)
+                except Exception as e:
+                    raise EX.FilterExecutionError(f"{f.name} filter raised {type(e).__name__}: {e}") from e
 
             checksum   = XoloUtils.sha256(value=value)
-            chunks_op  = Chunks.from_bytes(data=value, group_id=_key, chunk_size=Some(HF.parse_size(chunk_size)), chunk_prefix=Some(_key))
+            chunks_op  = Chunks.from_bytes(data=value, group_id=_ball_id, chunk_size=Some(HF.parse_size(chunk_size)), chunk_prefix=Some(_ball_id))
             router     = self.rlb.get_router()
             if not chunks_op.is_some:
                 raise ValueError("No valid chunks to upload.")
@@ -501,7 +568,7 @@ class AsyncClient():
 
             _input = {
                 "bucket_id": bucket_id,
-                "ball_id": _key,
+                "ball_id": _ball_id,
                 "chunk_size": chunk_size,
                 "rf": rf,
                 "timeout": timeout,
@@ -510,6 +577,7 @@ class AsyncClient():
                 "max_backoff": max_backoff,
                 "tags": tags,
                 "value_size": len(value),
+                "filters": [f.name for f in _filters],
             }
 
             async def upload_chunk(chunk: Chunk, attempt=1) -> Tuple[Chunk, Result[InterfaceX.PeerPutChunkedResponse, EX.MictlanXError]]:
@@ -522,14 +590,14 @@ class AsyncClient():
                         async with semaphore:
                             res = await AsyncClientUtils.put_chunk(
                                 router     = router,
-                                ball_id    = _key,
+                                ball_id    = _ball_id,
                                 client_id  = self.client_id,
                                 bucket_id  = _bucket_id,
                                 key        = chunk.chunk_id,
                                 chunk      = chunk,
                                 rf         = rf,
                                 timeout    = timeout,
-                                metadata   = {"num_chunks": str(num_chunks), "full_checksum": checksum, **tags},
+                                metadata   = {**tags, "num_chunks": str(num_chunks), "full_checksum": checksum, "mictlanx_filters": ",".join(f.name for f in _filters)},
                                 chunk_size = "1MB",
                             )
                         if res.is_ok:
@@ -549,7 +617,7 @@ class AsyncClient():
                                 "event": "PUT.CHUNK",
                                 "message": "chunk uploaded",
                                 "bucket_id": _bucket_id,
-                                "ball_id": _key,
+                                "ball_id": _ball_id,
                                 "key": chunk.chunk_id,
                                 "ok": True,
                                 "response_time_ms": elapsed_ms,
@@ -566,7 +634,7 @@ class AsyncClient():
                             "event": "PUT.CHUNK.RETRY",
                             "message": f"chunk upload failed on attempt {attempt}/{max_tries}",
                             "bucket_id": _bucket_id,
-                            "ball_id": _key,
+                            "ball_id": _ball_id,
                             "key": chunk.chunk_id,
                             "function": "upload_chunk",
                             "error_type": type(e).__name__,
@@ -594,8 +662,7 @@ class AsyncClient():
                 "event": "PUT",
                 "message": "put completed",
                 "bucket_id": _bucket_id,
-                "ball_id": _key,
-                "key": _key,
+                "ball_id": _ball_id,
                 "router": router.router_id,
                 "response_time_ms": round(elapsed_s * 1000, 2),
                 "input": _input,
@@ -615,8 +682,7 @@ class AsyncClient():
                     "event": "MAX.AVAILABILITY.REACHED",
                     "message": "no peers available",
                     "bucket_id": _bucket_id,
-                    "ball_id": _key,
-                    "key": _key,
+                    "ball_id": _ball_id,
                     "function": "put",
                     "error_type": type(_e).__name__,
                     "input": _input,
@@ -627,8 +693,7 @@ class AsyncClient():
                 "event": "PUT.ERROR",
                 "message": _e.message,
                 "bucket_id": _bucket_id,
-                "ball_id": _key,
-                "key": _key,
+                "ball_id": _ball_id,
                 "function": "put",
                 "error_type": type(_e).__name__,
                 "status_code": _e.status_code,
@@ -637,10 +702,11 @@ class AsyncClient():
             })
             return Err(e)
 
+    @_require_auth
     async def put_with_metadata(
         self,
         bucket_id: str,
-        key: str,
+        ball_id: str,
         value: bytes,
         chunk_size: str = "256kb",
         rf: int = 1,
@@ -659,7 +725,7 @@ class AsyncClient():
 
         Args:
             bucket_id: Destination bucket identifier.
-            key: Ball identifier.
+            ball_id: Ball identifier.
             value: Raw bytes to upload.
             chunk_size: Target size per chunk. Defaults to ``"256kb"``.
             rf: Replication factor. Defaults to ``1``.
@@ -675,7 +741,7 @@ class AsyncClient():
         """
         put_result = await self.put(
             bucket_id=bucket_id,
-            key=key,
+            ball_id=ball_id,
             value=value,
             chunk_size=chunk_size,
             rf=rf,
@@ -687,8 +753,9 @@ class AsyncClient():
         )
         if put_result.is_err:
             return Err(put_result.unwrap_err())
-        return await self.get_metadata(bucket_id=bucket_id, ball_id=key)
+        return await self.get_metadata(bucket_id=bucket_id, ball_id=ball_id)
 
+    @_require_auth
     async def put_single_chunk(self, bucket_id: str, ball_id: str, chunk: Chunk, chunk_size: str = "256kb", rf: int = 1, timeout: int = 120,max_tries:int = 5,max_concurrency:int =10,max_backoff:int=5,tags:Dict[str,str]={})->Result[bool,EX.MictlanXError]:
         """Upload a single pre-built :class:`Chunk` to a bucket.
 
@@ -864,6 +931,7 @@ class AsyncClient():
 
     
     
+    @_require_auth
     async def put_bulk(
         self,
         bulk_id:str, 
@@ -885,7 +953,7 @@ class AsyncClient():
                 tasks to the existing job.
             balls: List of :class:`BallK` typed-dicts describing what to
                 upload.  Each dict must have ``source`` (``bytes`` or file
-                path ``str``), ``bucket_id``, and ``key``; optional keys
+                path ``str``), ``bucket_id``, and ``ball_id``; optional keys
                 include ``tags``, ``rf``, ``chunk_size``, ``timeout``,
                 ``max_tries``, ``max_concurrency``, and ``max_backoff``.
             max_concurrency: Maximum items uploaded in parallel. Defaults to
@@ -919,7 +987,7 @@ class AsyncClient():
                     try:
                         source    = item['source']
                         bucket_id = item['bucket_id']
-                        key       = item['key']
+                        ball_id   = item['ball_id']
                         
                           # Get optional params with defaults from the item dict
                         tags                 = item.get('tags', {})
@@ -934,7 +1002,7 @@ class AsyncClient():
                             # It's a file path, use put_file
                             result = await self.put_file(
                                 bucket_id=bucket_id,
-                                key=key,
+                                ball_id=ball_id,
                                 path=source,
                                 tags=tags,
                                 chunk_size=chunk_size,
@@ -948,7 +1016,7 @@ class AsyncClient():
                             # It's in-memory data, use put
                             result = await self.put(
                                 bucket_id=bucket_id,
-                                key=key,
+                                ball_id=ball_id,
                                 value=source,
                                 tags=tags,
                                 chunk_size=chunk_size,
@@ -960,10 +1028,10 @@ class AsyncClient():
                             )
                         else:
                             raise EX.ValidationError(
-                                f"Invalid source type for key '{key}': "
+                                f"Invalid source type for ball_id '{ball_id}': "
                                 f"{type(source)}. Must be 'str' (path) or 'bytes'."
                             )
-                        
+
                         if result.is_ok:
                             return Ok(InterfaceX.BallKDTO.from_ballk(item))
                         else:
@@ -975,7 +1043,7 @@ class AsyncClient():
                         self.__log.warning({
                             "event": "PUT.BULK.ITEM.FAILURE",
                             "bucket_id": item.get('bucket_id'),
-                            "key": item.get('key'),
+                            "ball_id": item.get('ball_id'),
                             "error": _e.message
                         })
                         # Return Err with item and error
@@ -1004,6 +1072,7 @@ class AsyncClient():
             })
             return Err(_e)
 
+    @_require_auth
     async def await_bulk(
         self,
         bulk_id: str,
@@ -1059,6 +1128,7 @@ class AsyncClient():
             return Err(_e)
 
     # GET METHODS
+    @_require_auth
     async def get_chunk(
         self,
         bucket_id: str,
@@ -1278,9 +1348,10 @@ class AsyncClient():
                 "context": {},
             })
             raise _e
+    @_require_auth
     async def get_chunks(self,
         bucket_id: str,
-        key: str,
+        ball_id: str,
         max_parallel_gets: int = 10,
         headers: Dict[str, str] = {},
         chunk_size: str = "256kb",
@@ -1304,7 +1375,7 @@ class AsyncClient():
 
         Args:
             bucket_id: Source bucket identifier.
-            key: Ball identifier (chunk keys are ``{key}_{i}``).
+            ball_id: Ball identifier (chunk keys are ``{ball_id}_{i}``).
             max_parallel_gets: Maximum concurrent chunk downloads. Defaults to
                 ``10``.
             headers: Extra HTTP headers sent with each request.
@@ -1337,18 +1408,18 @@ class AsyncClient():
         try:
             t1         = T.monotonic()
             _bucket_id = Utils.sanitize_str(bucket_id)
-            _key       = Utils.sanitize_str(key)
+            _ball_id   = Utils.sanitize_str(ball_id)
             headers["Chunk-Size"] = chunk_size
             headers["Accept-Encoding"] = headers.get("Accept-Encoding", "identity")
             headers["Force-Get"] = str(headers.get("Force", str(int(force))))
 
             router            = self.rlb.get_router()
-            initial_chunk_key = f"{_key}{'_'+str(chunk_index) if chunk_index >= 0 else ''}"
+            initial_chunk_key = f"{_ball_id}{'_'+str(chunk_index) if chunk_index >= 0 else ''}"
             retry_policy      = RetryPolicy(retries=max_retries, initial_delay=delay, backoff_factor=backoff_factor, max_delay=max_delay, jitter=jitter)
 
             _input = {
                 "bucket_id": bucket_id,
-                "ball_id": key,
+                "ball_id": ball_id,
                 "chunk_size": chunk_size,
                 "timeout": timeout,
                 "max_retries": max_retries,
@@ -1367,7 +1438,7 @@ class AsyncClient():
                     "event": "GET.METADATA.FAILED.ATTEMPT",
                     "message": "metadata fetch attempt failed",
                     "bucket_id": bucket_id,
-                    "ball_id": key,
+                    "ball_id": ball_id,
                     "key": initial_chunk_key,
                     "input": _input,
                     "context": {"attempt": i, "max_attempts": retry_policy.retries},
@@ -1376,7 +1447,7 @@ class AsyncClient():
                     "event": "GET.METADATA.ERROR",
                     "message": str(e.message),
                     "bucket_id": bucket_id,
-                    "ball_id": key,
+                    "ball_id": ball_id,
                     "key": initial_chunk_key,
                     "function": "get_chunks",
                     "error_type": type(e).__name__,
@@ -1408,7 +1479,7 @@ class AsyncClient():
                         try:
                             async with semaphore:
                                 t2        = T.monotonic()
-                                chunk_key = f"{_key}_{i}"
+                                chunk_key = f"{_ball_id}_{i}"
                                 res       = await AsyncClientUtils.get_chunk(
                                     client=client,
                                     router=router,
@@ -1433,7 +1504,7 @@ class AsyncClient():
                                         "event": "GET.CHUNK",
                                         "message": "chunk fetched",
                                         "bucket_id": bucket_id,
-                                        "ball_id": key,
+                                        "ball_id": ball_id,
                                         "key": chunk_key,
                                         "ok": True,
                                         "response_time_ms": elapsed_ms,
@@ -1453,8 +1524,8 @@ class AsyncClient():
                                 "event": "GET.CHUNK.RETRY",
                                 "message": f"chunk fetch failed on attempt {attempt}/{max_retries}",
                                 "bucket_id": bucket_id,
-                                "ball_id": key,
-                                "key": f"{_key}_{i}",
+                                "ball_id": ball_id,
+                                "key": f"{_ball_id}_{i}",
                                 "function": "fetch_chunk_with_retry",
                                 "error_type": type(e).__name__,
                                 "input": _input,
@@ -1477,8 +1548,7 @@ class AsyncClient():
                                 "event": "CHUNK.FAILURE",
                                 "message": err.message,
                                 "bucket_id": _bucket_id,
-                                "ball_id": key,
-                                "key": _key,
+                                "ball_id": ball_id,
                                 "function": "get_chunks",
                                 "error_type": type(err).__name__,
                                 "status_code": err.status_code,
@@ -1497,8 +1567,8 @@ class AsyncClient():
                                 "event": "CHUNK.FAILURE",
                                 "message": err.message,
                                 "bucket_id": _bucket_id,
-                                "ball_id": key,
-                                "key": f"{_key}_{i}",
+                                "ball_id": ball_id,
+                                "key": f"{_ball_id}_{i}",
                                 "function": "get_chunks",
                                 "error_type": type(err).__name__,
                                 "status_code": err.status_code,
@@ -1513,14 +1583,13 @@ class AsyncClient():
                     raise EX.NotFoundError(f"Some chunks were missing: expected = {num_chunks}, chunks={completed}")
 
                 if len(rts_ms) == 0:
-                    raise EX.UnknownError(message=f"{_bucket_id}@{key} not found", status_code=404)
+                    raise EX.UnknownError(message=f"{_bucket_id}@{ball_id} not found", status_code=404)
 
                 self.__log.info({
                     "event": "GET",
                     "message": "get completed",
                     "bucket_id": _bucket_id,
-                    "ball_id": key,
-                    "key": _key,
+                    "ball_id": ball_id,
                     "router": router.router_id,
                     "response_time_ms": round((T.monotonic() - t1) * 1000, 2),
                     "input": _input,
@@ -1533,8 +1602,7 @@ class AsyncClient():
                 "event": "GET.ERROR",
                 "message": _e.message,
                 "bucket_id": bucket_id,
-                "ball_id": key,
-                "key": key,
+                "ball_id": ball_id,
                 "function": "get_chunks",
                 "error_type": type(_e).__name__,
                 "status_code": _e.status_code,
@@ -1543,9 +1611,10 @@ class AsyncClient():
             })
             raise _e
     
+    @_require_auth
     async def get(self,
         bucket_id:str,
-        key:str,
+        ball_id:str,
         max_paralell_gets:int = 10,
         headers:Dict[str,str]={},
         chunk_size:str="256kb",
@@ -1558,7 +1627,8 @@ class AsyncClient():
         max_backoff:int =5,
         chunk_index:int = 0,
         max_delay:int =30,
-        jitter:bool = True
+        jitter:bool = True,
+        filters:Optional[List[IOFilter]] = None
     )->Result[InterfaceX.AsyncGetResponse, EX.MictlanXError]:
         """Download all chunks of a ball and reassemble them into bytes.
 
@@ -1568,7 +1638,7 @@ class AsyncClient():
 
         Args:
             bucket_id: Source bucket identifier.
-            key: Ball identifier (chunk keys are ``{key}_{i}``).
+            ball_id: Ball identifier (chunk keys are ``{ball_id}_{i}``).
             max_paralell_gets: Maximum concurrent chunk downloads. Defaults to
                 ``10``.
             headers: Extra HTTP headers.
@@ -1586,6 +1656,14 @@ class AsyncClient():
                 to ``0``.
             max_delay: Hard ceiling on retry delay. Defaults to ``30``.
             jitter: Randomise retry delays. Defaults to ``True``.
+            filters: Ordered list of :class:`~mictlanx.filters.IOFilter`
+                transforms applied to the reassembled bytes, after the
+                SHA-256 integrity check and after verifying the list matches
+                the ``mictlanx_filters`` provenance tag recorded at
+                :meth:`put` time. Must be the correctly-ordered inverse of
+                the chain given to :meth:`put` (e.g. ``put(filters=[a, b])``
+                pairs with ``get(filters=[b_inverse, a_inverse])``). Defaults
+                to ``None`` (no filters — identical to today's behavior).
 
         Returns:
             ``Ok(AsyncGetResponse)`` whose ``data`` field is a
@@ -1595,17 +1673,17 @@ class AsyncClient():
         try:
             t1                    = T.monotonic()
             _bucket_id            = Utils.sanitize_str(bucket_id)
-            _key                  = Utils.sanitize_str(key)
+            _ball_id              = Utils.sanitize_str(ball_id)
             headers["Chunk-Size"] = chunk_size
             headers["Accept-Encoding"] = str(headers.get("Accept-Encoding", "identity"))
             headers["Force-Get"]  = str(headers.get("Force", int(force)))
             router                = self.rlb.get_router()
-            initial_chunk_key     = f"{_key}{'_'+str(chunk_index) if chunk_index >= 0 else ''}"
+            initial_chunk_key     = f"{_ball_id}{'_'+str(chunk_index) if chunk_index >= 0 else ''}"
             retry_policy          = RetryPolicy(retries=max_retries, initial_delay=delay, backoff_factor=backoff_factor, max_delay=max_delay, jitter=jitter)
 
             _input = {
                 "bucket_id": bucket_id,
-                "ball_id": key,
+                "ball_id": ball_id,
                 "chunk_size": chunk_size,
                 "timeout": timeout,
                 "max_retries": max_retries,
@@ -1623,7 +1701,7 @@ class AsyncClient():
                     "event": "GET.METADATA.FAILED.ATTEMPT",
                     "message": "metadata fetch attempt failed",
                     "bucket_id": bucket_id,
-                    "ball_id": key,
+                    "ball_id": ball_id,
                     "key": initial_chunk_key,
                     "input": _input,
                     "context": {"attempt": i, "max_attempts": retry_policy.retries},
@@ -1632,7 +1710,7 @@ class AsyncClient():
                     "event": "GET.METADATA.ERROR",
                     "message": str(e.message),
                     "bucket_id": bucket_id,
-                    "ball_id": key,
+                    "ball_id": ball_id,
                     "key": initial_chunk_key,
                     "function": "get",
                     "error_type": type(e).__name__,
@@ -1659,7 +1737,7 @@ class AsyncClient():
                             try:
                                 async with semaphore:
                                     t2        = T.monotonic()
-                                    chunk_key = f"{_key}_{i}"
+                                    chunk_key = f"{_ball_id}_{i}"
                                     res       = await AsyncClientUtils.get_chunk(
                                         client=client,
                                         router=router,
@@ -1684,7 +1762,7 @@ class AsyncClient():
                                             "event": "GET.CHUNK",
                                             "message": "chunk fetched",
                                             "bucket_id": bucket_id,
-                                            "ball_id": key,
+                                            "ball_id": ball_id,
                                             "key": chunk_key,
                                             "ok": True,
                                             "response_time_ms": elapsed_ms,
@@ -1704,8 +1782,8 @@ class AsyncClient():
                                     "event": "GET.CHUNK.RETRY",
                                     "message": f"chunk fetch failed on attempt {attempt}/{max_retries}",
                                     "bucket_id": bucket_id,
-                                    "ball_id": key,
-                                    "key": f"{_key}_{i}",
+                                    "ball_id": ball_id,
+                                    "key": f"{_ball_id}_{i}",
                                     "function": "fetch_chunk",
                                     "error_type": type(e).__name__,
                                     "input": _input,
@@ -1731,8 +1809,7 @@ class AsyncClient():
                         "event": "INTEGRITY.CHECK.FAILED",
                         "message": "checksum mismatch between remote and local",
                         "bucket_id": _bucket_id,
-                        "ball_id": key,
-                        "key": _key,
+                        "ball_id": ball_id,
                         "function": "get",
                         "error_type": "IntegrityError",
                         "input": _input,
@@ -1741,20 +1818,49 @@ class AsyncClient():
                     raise EX.IntegrityError(message=f"Integrity check failed: {remote_checksum} != {checksum}")
 
                 if len(rts_ms) == 0:
-                    return Err(EX.UnknownError(message=f"{_bucket_id}@{key} not found", status_code=404))
+                    return Err(EX.UnknownError(message=f"{_bucket_id}@{ball_id} not found", status_code=404))
 
                 self.__log.info({
                     "event": "GET",
                     "message": "get completed",
                     "bucket_id": _bucket_id,
-                    "ball_id": key,
-                    "key": _key,
+                    "ball_id": ball_id,
                     "router": router.router_id,
                     "response_time_ms": round((T.monotonic() - t1) * 1000, 2),
                     "input": _input,
                     "context": {"num_chunks": num_chunks, "checksum": checksum, "max_chunk_ms": max(rts_ms)},
                 })
                 metadatas = list(map(lambda x: x[0], responses))
+
+                _get_filters = filters or []
+                stored_filter_tag   = responses[0][0].tags.get("mictlanx_filters", "")
+                stored_filter_names = stored_filter_tag.split(",") if stored_filter_tag else []
+                if not IOFilter.names_match(stored=stored_filter_names, get_filters=_get_filters):
+                    given_reversed = list(reversed([f.name for f in _get_filters]))
+                    self.__log.warning({
+                        "event": "FILTER.MISMATCH",
+                        "message": "get() filters do not match the filters recorded at put() time",
+                        "bucket_id": _bucket_id,
+                        "ball_id": ball_id,
+                        "function": "get",
+                        "error_type": "FilterMismatchError",
+                        "input": _input,
+                        "context": {"stored_filters": stored_filter_names, "given_filters_reversed": given_reversed},
+                    })
+                    return Err(EX.FilterMismatchError(
+                        f"Filter mismatch for {_bucket_id}/{ball_id}: object was written with filters={stored_filter_names!r}, "
+                        f"but get() filters(reversed)={given_reversed!r}"
+                    ))
+
+                if _get_filters:
+                    data = x.tobytes()
+                    for f in _get_filters:
+                        try:
+                            data = f.filter(data)
+                        except Exception as e:
+                            return Err(EX.FilterExecutionError(f"{f.name} filter raised {type(e).__name__}: {e}"))
+                    x = memoryview(data)
+
                 return Ok(InterfaceX.AsyncGetResponse(data=x, metadatas=metadatas))
 
             raise EX.MictlanXError.from_exception(metadata_result.unwrap_err())
@@ -1765,8 +1871,7 @@ class AsyncClient():
                 "event": "GET.ERROR",
                 "message": _e.message,
                 "bucket_id": bucket_id,
-                "ball_id": key,
-                "key": key,
+                "ball_id": ball_id,
                 "function": "get",
                 "error_type": type(_e).__name__,
                 "status_code": _e.status_code,
@@ -1774,7 +1879,8 @@ class AsyncClient():
                 "context": {},
             })
             return Err(EX.MictlanXError.from_exception(e))
-    
+
+    @_require_auth
     async def get_to_file(self,
         bucket_id: str,
         ball_id: str,
@@ -1990,6 +2096,7 @@ class AsyncClient():
             return Err(_e)
         
     # --- METADATA METHODS ---
+    @_require_auth
     async def get_metadata_by_key(self,bucket_id:str, key:str,timeout: int = 120,headers: Dict[str, str] = {}, retry_policy: RetryPolicy = None)->Result[InterfaceX.GetMetadataResponse,EX.MictlanXError]:
         """Fetch the metadata record for a single chunk key.
 
@@ -2038,6 +2145,7 @@ class AsyncClient():
                 "context": {},
             })
             return Err(_e)
+    @_require_auth
     async def get_metadata(self,bucket_id:str,ball_id:str,timeout: int = 120,headers: Dict[str, str] = {},restart_policy: RetryPolicy = None)->Result[InterfaceX.Ball,EX.MictlanXError]:
         """Fetch and assemble the full :class:`Ball` metadata for a ball.
 
@@ -2062,7 +2170,7 @@ class AsyncClient():
             router     = self.rlb.get_router()
             _input = {"bucket_id": bucket_id, "ball_id": ball_id, "key": ball_id, "timeout": timeout}
             x = await raf(
-                func       = lambda: router.get_chunks_metadata(bucket_id=_bucket_id, key=_ball_id, timeout=timeout, headers=headers),
+                func       = lambda: router.get_chunks_metadata(bucket_id=_bucket_id, ball_id=_ball_id, timeout=timeout, headers=headers),
                 policy     = self.default_retry_policy if restart_policy is None else restart_policy,
                 on_attempt = lambda i: self.__log.debug({
                     "event": "GET.METADATA.BY.BALL.ID.FAILED.ATTEMPT",
@@ -2095,6 +2203,7 @@ class AsyncClient():
                 "context": {},
             })
             return Err(_e)      
+    @_require_auth
     async def get_bucket_metadata(
         self,
         bucket_id:str,
@@ -2132,6 +2241,7 @@ class AsyncClient():
                 "status":_e.status_code, 
             })
             return Err(_e)
+    @_require_auth
     async def get_chunks_by_bucket_id(
             self,
             bucket_id: str,
@@ -2201,6 +2311,7 @@ class AsyncClient():
 
 
     # --- DELETE METHODS ---
+    @_require_auth
     async def delete(self,
         ball_id:str,
         bucket_id:str,
@@ -2232,7 +2343,7 @@ class AsyncClient():
             router     = self.rlb.get_router()
             _input     = {"bucket_id": bucket_id, "ball_id": ball_id, "key": ball_id, "timeout": timeout, "force": force}
 
-            ball_metadata_result = await router.get_chunks_metadata(bucket_id=_bucket_id, key=_ball_id, timeout=timeout, headers=headers)
+            ball_metadata_result = await router.get_chunks_metadata(bucket_id=_bucket_id, ball_id=_ball_id, timeout=timeout, headers=headers)
             if ball_metadata_result.is_err:
                 return Err(ball_metadata_result.unwrap_err())
 
@@ -2267,9 +2378,10 @@ class AsyncClient():
                 "context": {},
             })
             return Err(_e)
+    @_require_auth
     async def delete_by_key(self,
                      key: str,
-                     bucket_id: str = "",
+                     bucket_id: str,
                      timeout: int = 120,
                      force:bool = True,
                      headers: Dict[str, str] = {}) -> Result[InterfaceX.DeletedByKeyResponse, EX.MictlanXError]:
@@ -2280,8 +2392,7 @@ class AsyncClient():
 
         Args:
             key: Chunk key to delete.
-            bucket_id: Bucket containing the key.  Falls back to the
-                client-level default bucket when empty.
+            bucket_id: Bucket containing the key.
             timeout: Per-request timeout in seconds. Defaults to ``120``.
             force: Send a ``Force`` header to force deletion. Defaults to
                 ``True``.
@@ -2293,7 +2404,6 @@ class AsyncClient():
         """
         _key = Utils.sanitize_str(x=key)
         _bucket_id = Utils.sanitize_str(x=bucket_id)
-        _bucket_id = self.__bucket_id if _bucket_id == "" else _bucket_id
         try:
             failed  = []
             del_res = InterfaceX.DeletedByKeyResponse(n_deletes=0, key=key)
@@ -2341,6 +2451,7 @@ class AsyncClient():
             })
             return Err(_e)    
     
+    @_require_auth
     async def delete_bucket(self, bucket_id: str, headers: Dict[str, str] = {}, timeout: int = 120,force:bool = True) -> Result[InterfaceX.DeleteBucketResponse, Exception]:
         """
         Asynchronously deletes the specified bucket by fetching metadata from each router,

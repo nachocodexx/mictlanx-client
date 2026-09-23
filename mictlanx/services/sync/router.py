@@ -142,10 +142,10 @@ class Router:
         except Exception as e:
             return Err(e)
 
-    def get_chunks_metadata(self,key:str,bucket_id:str="",timeout:int= 120,headers:Dict[str,str]={})->Result[Iterator[ResponseModels.Metadata],Exception]:
+    def get_chunks_metadata(self,ball_id:str,bucket_id:str,timeout:int= 120,headers:Dict[str,str]={})->Result[Iterator[ResponseModels.Metadata],Exception]:
 
         try:
-            response = R.get("{}/api/v{}/buckets/{}/metadata/{}/chunks".format(self.base_url(),self.api_version,bucket_id,key),timeout=timeout,headers=headers)
+            response = R.get("{}/api/v{}/buckets/{}/metadata/{}/chunks".format(self.base_url(),self.api_version,bucket_id,ball_id),timeout=timeout,headers=headers)
             response.raise_for_status()
             chunks_metadata_json = map(lambda x: ResponseModels.Metadata(**x) ,response.json())
             return Ok(chunks_metadata_json)

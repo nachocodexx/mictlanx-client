@@ -6,10 +6,10 @@ class BallK(TypedDict, total=False):
     """
     Defines the structure for a single item in a bulk put operation.
     'total=False' means all keys are optional except the required ones.
-    
+
     Required:
         bucket_id (str): The target bucket.
-        key (str): The object key.
+        ball_id (str): The object identifier.
         source (Union[bytes, str]): The data to upload, either as in-memory
                                    bytes or a string file path.
     Optional:
@@ -23,7 +23,6 @@ class BallK(TypedDict, total=False):
     """
     bucket_id: str
     ball_id: str
-    key: str
     source: Union[bytes, str]
     tags: Dict[str, str]
     rf: int
@@ -36,7 +35,6 @@ class BallKDTO(TypedDict):
     """Data Transfer Object for BallK without optional fields."""
     bucket_id: str
     ball_id: str
-    key: str
     source:str
     tags: Dict[str, str]
     rf: int
@@ -52,7 +50,6 @@ class BallKDTO(TypedDict):
         dto: BallKDTO = {
             "bucket_id": ball["bucket_id"],
             "ball_id": ball["ball_id"],
-            "key": ball["key"],
             "source": ball["source"] if isinstance(ball["source"], str) else "",
             "tags": ball.get("tags", {}),
             "rf": ball.get("rf", 1),

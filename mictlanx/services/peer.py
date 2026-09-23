@@ -424,12 +424,12 @@ class AsyncPeer(object):
         except Exception as e:
             return Err(e)
 
-    async def get_chunks_metadata(self, ball_id: str, bucket_id: str = "", timeout: int = 120, headers: Dict[str, str] = {}) -> Result[ResponseModels.GroupedBallResponse, Exception]:
+    async def get_chunks_metadata(self, ball_id: str, bucket_id: str, timeout: int = 120, headers: Dict[str, str] = {}) -> Result[ResponseModels.GroupedBallResponse, Exception]:
         """Retrieve grouped chunk metadata for a ball from this peer.
 
         Args:
             ball_id: Ball identifier to query.
-            bucket_id: Bucket containing the ball. Defaults to ``""``.
+            bucket_id: Bucket containing the ball.
             timeout: Request timeout in seconds. Defaults to ``120``.
             headers: Additional HTTP headers.
 
