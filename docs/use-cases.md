@@ -94,18 +94,18 @@ async def main():
         {
             "source"    : b"Hello, object 1",
             "bucket_id" : "my-bucket",
-            "key"       : "obj-1",
+            "ball_id"   : "obj-1",
             "tags"      : {"author": "alice"},
         },
         {
             "source"    : b"Hello, object 2",
             "bucket_id" : "my-bucket",
-            "key"       : "obj-2",
+            "ball_id"   : "obj-2",
         },
         {
             "source"    : "/data/report.pdf",   # file path → uses put_file
             "bucket_id" : "my-bucket",
-            "key"       : "report-2026",
+            "ball_id"   : "report-2026",
             "chunk_size": "1MB",
         },
     ]
@@ -129,7 +129,7 @@ async def main():
         print(f"Uploaded : {len(response.successes)} objects")
         print(f"Failed   : {len(response.failures)}  objects")
         for item, err in response.failures:
-            print(f"  FAILED key={item['key']}: {err.message}")
+            print(f"  FAILED ball_id={item['ball_id']}: {err.message}")
     else:
         print("Bulk job error:", result.unwrap_err())
 
@@ -165,7 +165,7 @@ async def main():
 
     result = await client.put_file(
         bucket_id       = "datasets",
-        key             = "imagenet-2026",
+        ball_id         = "imagenet-2026",
         path            = "/data/imagenet.tar.gz",
         chunk_size      = "4MB",        # larger chunks → fewer round-trips
         rf              = 2,            # keep 2 replicas
@@ -227,14 +227,14 @@ Use MictlanX as a shared object store so that multiple independent processes or 
 ```
 Producer (writes)         MictlanX VSS         Consumer (reads)
 ─────────────────    →   ─────────────   →    ─────────────────
-put(bucket, key, data)                         get(bucket, key)
+put(bucket, ball_id, data)                     get(bucket, ball_id)
 ```
 
-Because each object is identified by `(bucket_id, key)` and integrity is verified with SHA-256, the consumer always gets exactly what the producer wrote — even across machines or restarts.
+Because each object is identified by `(bucket_id, ball_id)` and integrity is verified with SHA-256, the consumer always gets exactly what the producer wrote — even across machines or restarts.
 
 ### Example
 
-**Producer** — writes a processed result and signals it is ready via a known key:
+**Producer** — writes a processed result and signals it is ready via a known ball_id:
 
 ```python
 import asyncio, pickle
@@ -250,7 +250,7 @@ async def produce():
 
     ok = await client.put(
         bucket_id  = "pipeline",
-        key        = "inference-result-run42",
+        ball_id    = "inference-result-run42",
         value      = payload,
         tags       = {"status": "ready", "run": "42"},
     )
@@ -259,7 +259,7 @@ async def produce():
 asyncio.run(produce())
 ```
 
-**Consumer** — polls for the key and processes it when available:
+**Consumer** — polls for the ball_id and processes it when available:
 
 ```python
 import asyncio, pickle
@@ -273,7 +273,7 @@ async def consume():
     policy = RetryPolicy(retries=10, initial_delay=2.0, backoff_factor=1.5)
 
     res = await raf(
-        func   = lambda: client.get(bucket_id="pipeline", key="inference-result-run42"),
+        func   = lambda: client.get(bucket_id="pipeline", ball_id="inference-result-run42"),
         policy = policy,
     )
 
@@ -291,7 +291,7 @@ asyncio.run(consume())
 
 | Scenario | Recommendation |
 |---|---|
-| ML pipeline stages (train → eval → deploy) | Each stage writes its output under a versioned key |
-| Microservices sharing large payloads | Avoid embedding blobs in message queues; pass only the key |
+| ML pipeline stages (train → eval → deploy) | Each stage writes its output under a versioned ball_id |
+| Microservices sharing large payloads | Avoid embedding blobs in message queues; pass only the ball_id |
 | Cross-machine result handoff | Both sides connect to the same VSS; no direct link needed |
-| Checkpoint / resume | Write intermediate state with a fixed key; consumer reads on restart |
+| Checkpoint / resume | Write intermediate state with a fixed ball_id; consumer reads on restart |

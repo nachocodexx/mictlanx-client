@@ -368,7 +368,7 @@ See [Environment Variables](environment-variables.md) for the full reference.
 The client cuts your payload into chunks, uploads them in parallel with retries, and stores the checksum in the object’s metadata for integrity verification later.
 
 ```python
-client.put(bucket_id=bucket_id, key=key, value = data, tags ={},chunk_size = "1KB", )
+client.put(bucket_id=bucket_id, ball_id=ball_id, value = data, tags ={},chunk_size = "1KB", )
 ```
 This example is implemented in ```examples/client/01_put.py```.
 
@@ -389,7 +389,7 @@ python3 examples/client/01_put.py \
 # fetch bytes back into memory
 res = await client.get(
     bucket_id    = bucket_id,
-    key          = key,        # the same logical id you used on PUT
+    ball_id      = ball_id,
     chunk_size   = "1MB",      # request size hint; peer may adjust
     max_retries  = 8,
     max_paralell_gets = 8,     # parallel chunk downloads
@@ -409,7 +409,7 @@ If you prefer to write directly to disk (streamed, ordered), use ```get_to_file(
 ```python
 path_res = await client.get_to_file(
     bucket_id     = bucket_id,
-    ball_id       = key,       # same value as `key` above
+    ball_id       = ball_id,
     output_path   = "./downloads",
     fullname      = "hello.txt",  # optional; defaults from tags if present
     chunk_size    = "1MB",
@@ -430,13 +430,13 @@ Run it from the CLI (works with the local stack started by ```deploy_router.sh``
 # bytes into memory (prints size)
 python3 examples/client/02_get.py \
   --bucket_id mictlanx \
-  --key       hello-object \
+  --ball_id   hello-object \
   --chunk_size 1MB
 
 # stream directly to a file
 python3 examples/client/02_get.py \
   --bucket_id mictlanx \
-  --key       hello-object \
+  --ball_id   hello-object \
   --to_file \
   --out       ./downloads \
   --fullname  hello.txt \
@@ -444,7 +444,7 @@ python3 examples/client/02_get.py \
 
 ```
 
-⚠️ ```--key``` must match the logical id you used on PUT.
+⚠️ ```--ball_id``` must match the logical id you used on PUT.
 
 #### 3. Put a file from disk
 
@@ -453,7 +453,7 @@ Use `put_file` when the data lives on disk and you don't want to read the whole 
 ```python
 result = await client.put_file(
     bucket_id       = bucket_id,
-    key             = "my-report",
+    ball_id         = "my-report",
     path            = "/data/report.pdf",
     chunk_size      = "1MB",
     rf              = 1,
@@ -475,9 +475,9 @@ else:
 from mictlanx.interfaces import BallK
 
 balls: list[BallK] = [
-    {"source": b"data-a", "bucket_id": bucket_id, "key": "obj-a"},
-    {"source": b"data-b", "bucket_id": bucket_id, "key": "obj-b"},
-    {"source": "/data/file.bin", "bucket_id": bucket_id, "key": "obj-c"},
+    {"source": b"data-a", "bucket_id": bucket_id, "ball_id": "obj-a"},
+    {"source": b"data-b", "bucket_id": bucket_id, "ball_id": "obj-b"},
+    {"source": "/data/file.bin", "bucket_id": bucket_id, "ball_id": "obj-c"},
 ]
 
 await client.put_bulk(bulk_id="job-1", balls=balls, max_concurrency=5)
@@ -494,13 +494,13 @@ Retrieve metadata for a single chunk key or for all chunks of a ball:
 
 ```python
 # Single chunk key (e.g. the first chunk of a ball)
-meta_result = await client.get_metadata_by_key(bucket_id=bucket_id, key=f"{key}_0")
+meta_result = await client.get_metadata_by_key(bucket_id=bucket_id, key=f"{ball_id}_0")
 if meta_result.is_ok:
     meta = meta_result.unwrap().metadata
     print(meta.size, meta.checksum, meta.tags)
 
 # All chunks of a ball, assembled into a Ball object
-ball_result = await client.get_metadata(bucket_id=bucket_id, ball_id=key)
+ball_result = await client.get_metadata(bucket_id=bucket_id, ball_id=ball_id)
 if ball_result.is_ok:
     ball = ball_result.unwrap()
     print(f"ball has {ball.len_chunks()} chunks, total size {ball.size}")
@@ -523,12 +523,12 @@ Delete a whole ball (all its chunks) or a single chunk key:
 
 ```python
 # Delete all chunks of a ball
-del_result = await client.delete(ball_id=key, bucket_id=bucket_id)
+del_result = await client.delete(ball_id=ball_id, bucket_id=bucket_id)
 if del_result.is_ok:
     print("deleted", del_result.unwrap().n_deletes, "chunk(s)")
 
 # Delete a specific chunk key
-del_key_result = await client.delete_by_key(key=f"{key}_0", bucket_id=bucket_id)
+del_key_result = await client.delete_by_key(key=f"{ball_id}_0", bucket_id=bucket_id)
 ```
 
 ---
