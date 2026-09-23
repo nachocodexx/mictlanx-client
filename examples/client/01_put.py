@@ -58,7 +58,7 @@ async def main():
 
     # client.put(
     #     bucket_id = "cubeton",
-    #     key       = "mipelota",
+    #     ball_id   = "mipelota",
     #     value     = data
     # )
 
@@ -67,7 +67,7 @@ async def main():
 
     res = await client.put_file(
         bucket_id   = args.bucket_id,
-        key         = args.ball_id,      # we use ball_id as the logical key/group id
+        ball_id     = args.ball_id,
         path        = args.path,
         chunk_size  = args.chunk_size,
         rf          = args.rf,

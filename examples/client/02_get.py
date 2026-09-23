@@ -37,7 +37,7 @@ async def main():
         # Read to memory
         res = await client.get(
             bucket_id  = args.bucket_id,
-            key        = args.ball_id,   # same id used at PUT time
+            ball_id    = args.ball_id,
             chunk_size = args.chunk_size,
         )
         if res.is_ok:

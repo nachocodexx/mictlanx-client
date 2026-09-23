@@ -15,7 +15,7 @@ client = AsyncClient(
 async def main_get():
     # GET dataframe as bytes, convert back to dataframe
     df_bytes_result = await raf(
-        func   = lambda: client.get(bucket_id="dataframes", key="iris1"),
+        func   = lambda: client.get(bucket_id="dataframes", ball_id="iris1"),
         policy = RetryPolicy(
             retries= 3
         )
@@ -41,7 +41,7 @@ async def main_put():
 
     result = await client.put(
         bucket_id = "dataframes",
-        key       = "iris1",
+        ball_id   = "iris1",
         value     = data,
         tags      = {
             "columns": cols, 
@@ -52,7 +52,7 @@ async def main_put():
     assert result.is_ok, f"Put operation failed: {result.unwrap_err()}"
     # # GET
     # df_bytes_result = await raf(
-    #     func   = lambda: client.get(bucket_id="dataframes", key="iris"),
+    #     func   = lambda: client.get(bucket_id="dataframes", ball_id="iris"),
     #     policy = RetryPolicy(
     #         retries= 3
     #     )
