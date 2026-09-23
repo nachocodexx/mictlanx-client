@@ -39,7 +39,7 @@ async def setup_test_bucket_with_balls(async_client: AsyncClient, unique_id: str
         put_tasks.append(
             async_client.put(
                 bucket_id=bucket_id,
-                key=ball["key"],  # Use the simple string key
+                ball_id=ball["key"],  # Use the simple string key
                 value=ball["data"],
                 rf=1,
                 chunk_size="10kb",

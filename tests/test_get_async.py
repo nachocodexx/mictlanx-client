@@ -3,6 +3,8 @@ import pytest_asyncio
 from mictlanx import AsyncClient
 from pathlib import Path
 from mictlanx.interfaces import Ball
+from mictlanx.filters import CompressFilter, DecompressFilter
+import mictlanx.errors as EX
 import dotenv
 dotenv.load_dotenv(".env.test")
 # --- Fixtures ---
@@ -18,7 +20,7 @@ async def setup_test_object(async_client: AsyncClient, unique_id: str):
 
     put_result = await async_client.put(
         bucket_id  = bucket_id,
-        key        = ball_id,
+        ball_id    = ball_id,
         value      = test_data,
         rf         = 1,
         chunk_size = "10kb",
@@ -88,7 +90,7 @@ async def test_get(async_client: AsyncClient, setup_test_object):
 
     x_result = await async_client.get(
         bucket_id         = bucket_id,
-        key               = ball_id,
+        ball_id           = ball_id,
         max_paralell_gets = 4,
         chunk_size        = "1mb",
         force             = True,
@@ -110,7 +112,7 @@ async def test_get_chunks_generator_ordered(async_client: AsyncClient, setup_tes
 
     async for chunk_metadata, chunk_data in async_client.get_chunks(
         bucket_id         = bucket_id,
-        key               = ball_id,
+        ball_id           = ball_id,
         max_parallel_gets = 4,
         chunk_size        = "1mb",
         backoff_factor    = 1.5,
@@ -125,3 +127,61 @@ async def test_get_chunks_generator_ordered(async_client: AsyncClient, setup_tes
 
     assert len(downloaded_chunks_list) > 0, "No chunks were downloaded"
     assert b"".join(downloaded_chunks_list) == original_data, "Reassembled data does not match"
+
+
+@pytest.mark.asyncio
+async def test_put_get_roundtrip_with_filters(async_client: AsyncClient, unique_id: str):
+    """Tests that put(filters=...) + get(filters=...) round-trips to the original bytes."""
+    bucket_id     = f"pytest-get-filters-bucket-{unique_id}"
+    ball_id       = f"pytest-get-filters-ball-{unique_id}"
+    original_data = (f"Filtered data for {ball_id}. " * 100).encode("utf-8")
+
+    put_result = await async_client.put(
+        bucket_id  = bucket_id,
+        ball_id    = ball_id,
+        value      = original_data,
+        rf         = 1,
+        chunk_size = "10kb",
+        filters    = [CompressFilter()],
+    )
+    assert put_result.is_ok, f"put with filters failed: {put_result.unwrap_err()}"
+
+    get_result = await async_client.get(
+        bucket_id = bucket_id,
+        ball_id   = ball_id,
+        filters   = [DecompressFilter()],
+    )
+    assert get_result.is_ok, f"get with filters failed: {get_result.unwrap_err()}"
+    assert get_result.unwrap().data == original_data, "Recovered data does not match the original plaintext"
+
+    delete_result = await async_client.delete_bucket(bucket_id=bucket_id, force=True)
+    assert delete_result.is_ok, f"cleanup failed: {delete_result.unwrap_err()}"
+
+
+@pytest.mark.asyncio
+async def test_get_with_mismatched_filters_raises(async_client: AsyncClient, unique_id: str):
+    """Tests that get() called with the wrong filter list returns FilterMismatchError."""
+    bucket_id     = f"pytest-get-filters-mismatch-bucket-{unique_id}"
+    ball_id       = f"pytest-get-filters-mismatch-ball-{unique_id}"
+    original_data = (f"Filtered data for {ball_id}. " * 100).encode("utf-8")
+
+    put_result = await async_client.put(
+        bucket_id  = bucket_id,
+        ball_id    = ball_id,
+        value      = original_data,
+        rf         = 1,
+        chunk_size = "10kb",
+        filters    = [CompressFilter()],
+    )
+    assert put_result.is_ok, f"put with filters failed: {put_result.unwrap_err()}"
+
+    get_result = await async_client.get(
+        bucket_id = bucket_id,
+        ball_id   = ball_id,
+        filters   = [],
+    )
+    assert get_result.is_err, "get() with a mismatched filter list should fail, not silently return garbage"
+    assert isinstance(get_result.unwrap_err(), EX.FilterMismatchError)
+
+    delete_result = await async_client.delete_bucket(bucket_id=bucket_id, force=True)
+    assert delete_result.is_ok, f"cleanup failed: {delete_result.unwrap_err()}"

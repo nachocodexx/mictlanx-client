@@ -272,7 +272,7 @@ async def test_get_chunks_metadata(router: AsyncRouter, unique_id, sample_data):
     assert res.is_ok, f"Put Chunked failed: {res.unwrap_err()}"
 
     # Test
-    res = await router.get_chunks_metadata(key=ball_id, bucket_id=bucket)
+    res = await router.get_chunks_metadata(ball_id=ball_id, bucket_id=bucket)
     
     assert res.is_ok
     meta = res.unwrap()

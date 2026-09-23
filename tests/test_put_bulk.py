@@ -26,7 +26,6 @@ async def test_put_bulk(async_client: AsyncClient):
             InterfaceX.BallK(
                 bucket_id       = bucket_id,
                 ball_id         = f"ball_{key}",
-                key             = key,
                 source          = content,
                 chunk_size      = "1MB",
                 tags            = {"test_bulk": "true"},

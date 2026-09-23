@@ -5,6 +5,7 @@ import humanfriendly as HF
 from pathlib import Path
 from option import Some
 from mictlanx.utils.segmentation import Chunks, Chunk
+from mictlanx.filters import CompressFilter
 import uuid
 
 # Load environment variables from .env at the start
@@ -67,7 +68,7 @@ async def test_put_chunks(async_client, small_temp_file, bucket_id_param, key_pa
 
     x = await async_client.put_chunks(
         bucket_id=bucket_id,
-        key=key,
+        ball_id=key,
         rf=rf,
         chunks=chunks,
         max_tries=1
@@ -86,7 +87,7 @@ async def test_put_file(async_client, large_temp_file, bucket_id_param, key_para
     x = await async_client.put_file(
         bucket_id=bucket_id,
         chunk_size=chunk_size,
-        key=key,
+        ball_id=key,
         rf=rf,
         path=path,
         max_tries=10
@@ -109,7 +110,7 @@ async def test_put(async_client, small_temp_file, bucket_id_param, key_param):
     x = await async_client.put(
         bucket_id=bucket_id,
         chunk_size=chunk_size,
-        key=key,
+        ball_id=key,
         rf=rf,
         value=data,
         max_tries=1,
@@ -155,3 +156,30 @@ async def test_put_single_chunk(async_client, small_temp_file, bucket_id_param, 
         )
         print(f"put_single_chunk result: {x}")
         assert x.is_ok, f"put_single_chunk failed: {x.unwrap_err()}"
+
+@pytest.mark.asyncio
+async def test_put_with_filters_sets_provenance_tag(async_client, small_temp_file, bucket_id_param, key_param):
+    """Tests that put(filters=...) records the mictlanx_filters provenance tag."""
+    key = str(key_param)
+    bucket_id = str(bucket_id_param)
+    path = str(small_temp_file)
+
+    with open(path, "rb") as f:
+        data = f.read()
+
+    x = await async_client.put(
+        bucket_id=bucket_id,
+        ball_id=key,
+        value=data,
+        rf=1,
+        chunk_size="25MB",
+        max_tries=1,
+        filters=[CompressFilter()],
+    )
+    print(f"put with filters result: {x}")
+    assert x.is_ok, f"put with filters failed: {x.unwrap_err()}"
+
+    metadata_result = await async_client.get_metadata(bucket_id=bucket_id, ball_id=key)
+    assert metadata_result.is_ok, f"get_metadata failed: {metadata_result.unwrap_err()}"
+    ball = metadata_result.unwrap()
+    assert ball.chunks[0].tags.get("mictlanx_filters") == "compress"

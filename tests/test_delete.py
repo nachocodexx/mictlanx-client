@@ -19,7 +19,7 @@ async def test_delete_object(async_client: AsyncClient, unique_id: str):
     # 1. SETUP: Create the object we intend to delete
     put_result = await async_client.put(
         bucket_id=bucket_id,
-        key=ball_id,  # Assuming 'key' is the same as 'ball_id' for put
+        ball_id=ball_id,
         value=test_data,
         rf=1,
         chunk_size="1MB" # Use a sensible default
@@ -65,7 +65,7 @@ async def test_put_n_balls_in_bucket(async_client: AsyncClient, unique_id: str):
             put_tasks.append(
                 async_client.put(
                     bucket_id=bucket_id,
-                    key=ball_id,
+                    ball_id=ball_id,
                     value=test_data,
                     rf=1,
                     chunk_size="1MB" # Use a sensible default
