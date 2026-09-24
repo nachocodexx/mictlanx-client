@@ -35,15 +35,21 @@ It lets you PUT/GET large objects reliably across a pool of storage peers throug
 - **End-to-end integrity**: SHA-256 checksum verification on writes/reads.
 - **Metadata & tags**: attach and query key/value tags per object (ball) and bucket.
 - **Client-side caching** to speed up repeated reads.
+- **Bucket/Ball API**: an exception-raising, cache-backed layer (`mictlanx.objects`) for everyday use.
+- **Access stats**: local per-ball counters and a decayed access frequency (`client.stats`).
+- **Local VSS from Python**: deploy and elastically scale a router + peers with Docker (`mictlanx.vss`).
 - **Simple API & examples** to get productive fast.
 
 > MictlanX Client targets object storage use cases (store, fetch, list, and replicate objects).  
 > It’s alpha software—interfaces may evolve between minor versions.
 
+📖 **Documentation:** https://jub-ecosystem.github.io/mictlanx-client
+
 
 ## Table of contents
 
 - [Prerequisites](#prerequisites-)
+- [Installing extras](#installing-extras-)
 - [Conceptual Architecture](#conceptual-architecture)
   - [Data granularity](#data-granularity)
   - [1. Peer](#1-peer)
@@ -68,6 +74,8 @@ It lets you PUT/GET large objects reliably across a pool of storage peers throug
   - [Configuration via environment variables](#configuration-via-environment-variables)
   - [1. Put](#1-put)
   - [2. Get](#2-get)
+  - [3. Bucket/Ball API](#3-bucketball-api)
+  - [4. Local VSS from Python](#4-local-vss-from-python)
 - [Project Structure](#project-structure-)
 - [Keypair generation (Optional)](#keypair-generation-optional)
 - [Contributing](#contributing)
@@ -76,7 +84,7 @@ It lets you PUT/GET large objects reliably across a pool of storage peers throug
 
 
 
-## Prerequisites 🧾
+## Prerequisites 
 
 You must meet the prerequisites to run successfully the MictlanX Client:
 
@@ -113,6 +121,33 @@ You must meet the prerequisites to run successfully the MictlanX Client:
     ```
 
   <!-- :warning: Make sure to assign the right permissions. -->
+
+## Installing extras
+
+MictlanX ships several optional dependency groups (Poetry "extras"). The base install (`poetry install`) covers the core client; install extras only if you need the feature they enable:
+
+| Extra | Installs | Enables |
+|---|---|---|
+| `compression` | `lz4` | Chunk compression |
+| `rich` | `rich` | Colored console log output (`MICTLANX_LOG_RICH=1`) |
+| `tqdm` | `tqdm` | Progress bars in bulk operations (`AsyncClient.bulk_put`, etc.) |
+| `progress` | `rich` + `tqdm` | Both of the above |
+| `crypto` | `cryptography` | Keypair generation / encryption (see [Keypair generation](#keypair-generation-optional)) |
+| `vss` | `docker` | Local test infrastructure via Docker (`deploy_peer.sh`, `deploy_router.sh`) |
+
+With Poetry:
+```sh
+poetry install --extras "rich tqdm"
+# or install every extra
+poetry install --all-extras
+```
+
+With pip (from PyPI/TestPyPI):
+```sh
+pip install "mictlanx[rich,tqdm]"
+# or combine several
+pip install "mictlanx[progress,crypto,vss,compression]"
+```
 
 
 ## Conceptual Architecture 
@@ -563,8 +598,10 @@ Every `AsyncClient` constructor parameter has a `MICTLANX_CLIENT_*` or `MICTLANX
 | `MICTLANX_CLIENT_ID` | random hex | Client identity / logger name |
 | `MICTLANX_CLIENT_DEBUG` | `1` | Echo log records to console |
 | `MICTLANX_CLIENT_MAX_WORKERS` | `12` | Thread-pool upper bound |
-| `MICTLANX_CLIENT_EVICTION_POLICY` | `LRU` | Cache strategy (`LRU` or `LFU`) |
-| `MICTLANX_CLIENT_CAPACITY_STORAGE` | `1GB` | In-memory cache size |
+| `MICTLANX_CLIENT_EVICTION_POLICY` | `LFU` | Cache strategy (`LFU` with decay, or `LRU`) |
+| `MICTLANX_CLIENT_CAPACITY_STORAGE` | `1GB` | In-memory cache size (upper bound; memory is only used by cached objects) |
+| `MICTLANX_CLIENT_CACHE_DEFAULT` | `0` | Whether `AsyncClient.get()` uses the cache when `cache=` is not passed |
+| `MICTLANX_CLIENT_HALF_LIFE` | `10m` | Decay half-life of the access frequency (`client.stats`, LFU eviction) |
 | `MICTLANX_CLIENT_VERIFY` | `0` | SSL verification (`0` = off, `1` = system CAs) |
 
 **Logging:**
@@ -666,6 +703,66 @@ python3 examples/client/02_get.py \
 
 ⚠️ ```--key``` must match the logical id you used on PUT.
 
+`get()` does not cache by default. Pass `cache=True` (or create the client with `cache_default=True`) to keep the downloaded bytes in memory: the next `get()` costs one metadata request instead of a download, as long as the stored checksum hasn't changed. `force=True` always downloads.
+
+#### 3. Bucket/Ball API
+`mictlanx.objects` is a small, exception-raising layer on top of `AsyncClient`. Reads always go through the cache, and every ball exposes this client's access stats.
+
+```python
+from mictlanx import AsyncClient
+from mictlanx.objects import Bucket, BallConflictError
+
+async with AsyncClient(uri=URI) as mx:
+    bk   = mx.bucket("bk1")                 # or Bucket("bk1") inside the `async with`
+    ball = await bk.put("b1", b"hello", tags={"owner": "me"})   # -> Ball (metadata, no data)
+    data = await bk.get("b1")               # -> bytes (cached)
+    meta = await bk.get_metadata("b1")      # -> Ball
+
+    print(ball.num_gets, ball.hits, ball.misses, ball.freq)   # local, live stats
+    await ball.replicate(2)                 # replication = put the same data again
+
+    try:
+        await bk.put("b1", b"other data")   # balls are immutable
+    except BallConflictError:
+        ...
+
+    async for b in bk.balls():              # list the bucket
+        print(b.ball_id, b.size, b.tags)
+
+    result = await bk.put_many([("a", b"1"), ("b", b"2")])     # result.ok / result.failed
+```
+
+- `freq` is a decayed score: roughly the recent gets per second, halving every `half_life` (default `10m`) without reads. `num_gets` is the lifetime count.
+- Stats count only what this client did (puts and gets), are kept after cache eviction, and never touch the network.
+
+See `examples/new_api/` for runnable scripts (quickstart, metadata/listing, access stats, cache behaviour, replication/conflicts, `put_many`, filters).
+
+#### 4. Local VSS from Python
+`mictlanx.vss.VirtualStorageSpace` deploys a complete local VSS (router + summoner + rm + a pool of peers) through the Docker Engine API, so you don't need `deploy_router.sh`. You can also grow or shrink the peer pool at runtime. It requires a running Docker daemon and the `vss` extra (`pip install "mictlanx[vss]"`).
+
+```python
+from mictlanx import AsyncClient
+from mictlanx.vss import VirtualStorageSpace
+
+async with VirtualStorageSpace(peers=2, vss_id="my-vss") as vs:   # up() on enter, down() on exit
+    print(vs.size, vs.peer_ids())
+
+    async with AsyncClient(uri=vs.uri) as mx:                      # vs.uri is a ready mictlanx:// URI
+        bk = mx.bucket("bk1")
+        await bk.put("b1", b"hello")
+        print(await bk.get("b1"))
+
+    await vs.expand(n=2)      # add 2 peers (alias: vs.elastic(n=2))
+    await vs.retract(n=1)     # remove the most recently added peer (LIFO)
+    print(await vs.stats())   # per-peer stats reported by the router
+```
+
+- `VirtualStorageSpace(...)` only stores the desired state. Containers are created by `up()`, `expand()` or entering `async with`.
+- `async with` always tears the cluster down, even if the block raises.
+- Methods return `Result`, like the rest of the SDK.
+
+See `examples/vss/` for runnable scripts (deploy, elastic scaling, context manager).
+
 
 
 
@@ -696,22 +793,27 @@ python3 examples/client/02_get.py \
 ├── examples/                     # Minimal, runnable examples
 │   ├── client/                   # AsyncClient examples (put/get, files, metadata)
 │   ├── data/                     # Sample assets for examples
+│   ├── new_api/                  # Bucket/Ball API examples (mictlanx.objects)
 │   ├── peer/                     # AsyncPeer examples (direct to peer)
 │   ├── router/                   # AsyncRouter examples (LB, retries)
-│   └── use-cases/                # Higher-level scenarios
+│   ├── use-cases/                # Higher-level scenarios
+│   └── vss/                      # VirtualStorageSpace examples (deploy, elastic scaling)
 ├── mictlanx/                     # Python package (flattened layout)
 │   ├── __init__.py
 │   ├── apac/                     # (Reserved) Availability/Policy/Control modules
 │   ├── asyncx/                   # Async helpers: load balancer, async utils
 │   ├── caching/                  # CacheFactory & in-memory stores (LRU, etc.)
+│   │   └── stats.py              # AccessStats: local per-ball counters + decayed frequency
 │   ├── errors/                   # Typed exceptions & error helpers
 │   ├── interfaces/               # Typed dataclasses/DTOs (Peer, Router, Metadata…)
 │   ├── ipc/                      # Client<->service contracts & envelopes (if any)
 │   ├── logger/                   # Structured logging utilities
+│   ├── objects/                  # Bucket/Ball handles (exception-raising, cache-backed)
 │   ├── retry/                    # RetryPolicy, raf() (exponential backoff/jitter)
 │   ├── services/                 # AsyncPeer / AsyncRouter client implementations
 │   ├── types/                    # Common type aliases (e.g. VerifyType)
-│   └── utils/                    # Utilities (URI parser, chunking, compression, etc.)
+│   ├── utils/                    # Utilities (URI parser, chunking, compression, etc.)
+│   └── vss/                      # VirtualStorageSpace: deploy/scale a local VSS via Docker
 ├── mictlanx-peer.yml             # Docker Compose: 1+ peers (localhost)
 ├── mictlanx-router.yml           # Docker Compose: 1 router + 2 peers (localhost)
 ├── mkdocs.yml                    # Docs site config (MkDocs Material, nav, theme)
@@ -721,6 +823,7 @@ python3 examples/client/02_get.py \
 ├── pyproject.toml                # Project metadata & dependencies
 ├── requirements.txt              # Runtime deps (pip install -r)
 ├── run_docs.sh                   # Serve docs locally (mkdocs serve)
+├── zensical.toml                 # Docs site config (Zensical: nav, theme, mkdocstrings)
 ├── scripts/
 │   └── gen_ref_pages.py          # Script to generate API ref pages into docs/
 └── tests/                        # Pytest suite (unit/integration)
@@ -737,7 +840,11 @@ python3 examples/client/02_get.py \
     ├── test_router_lb.py         # Router LB selection behavior
     ├── test_summoner.py          # (Reserved/module tests)
     ├── test_uri.py               # MictlanXURI parsing/building
-    └── test_utils.py             # Generic utilities
+    ├── test_utils.py             # Generic utilities
+    ├── test_cache.py             # Cache public interface (LRU/LFU)
+    ├── test_cache_edge_cases.py  # Cache edge cases
+    ├── test_new_api_cache.py     # Bucket/Ball API + cache behaviour
+    └── test_vss.py               # VirtualStorageSpace
 
 ```
 

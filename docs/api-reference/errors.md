@@ -35,3 +35,13 @@
 ::: mictlanx.errors.PermissionError
 
 ::: mictlanx.errors.MaxAvailabilityReachedError
+
+::: mictlanx.errors.BadParametersError
+
+::: mictlanx.errors.BallConflictError
+
+::: mictlanx.errors.NoActiveClientError
+
+::: mictlanx.errors.DockerNotAvailableError
+
+::: mictlanx.errors.VSSNotDeployedError

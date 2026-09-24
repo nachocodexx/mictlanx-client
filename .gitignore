@@ -21,3 +21,5 @@ CLAUDE.md
 .claude
 .mictlanx
 .vscode/
+.ruff_cache/
+.pytest_cache/

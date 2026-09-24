@@ -108,7 +108,7 @@ class AsyncClientUtils:
             async def place_chunk(metadata, chunk):
                 """Places chunk in the correct position."""
                 index = int(metadata.tags["index"])  # Convert string index to int
-                if index <= num_chunks:
+                if 0 <= index < num_chunks:
                     ordered_chunks[index] = chunk  # ✅ Insert into correct position
                 else: 
                     raise EX.ValidationError(message=f"Index out of range:{index} > {num_chunks}")
@@ -120,8 +120,8 @@ class AsyncClientUtils:
             if None in ordered_chunks:
                 raise ValueError("Some chunks are missing")
 
-            # ✅ Merge all chunks into one contiguous memoryview
-            merged = b"".join(chunk.tobytes() for chunk in ordered_chunks)
+            # ✅ Merge all chunks into one contiguous memoryview (join reads the buffers directly: a single copy)
+            merged = b"".join(ordered_chunks)
 
             return memoryview(merged)
         except Exception as e:

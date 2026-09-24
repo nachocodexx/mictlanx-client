@@ -36,6 +36,12 @@ It lets you PUT/GET large objects reliably across a pool of storage peers throug
 
 - **Client-side caching** to speed up repeated reads.
 
+- **Bucket/Ball API**: an exception-raising, cache-backed layer (`mictlanx.objects`) for everyday use.
+
+- **Access stats**: local per-ball counters and a decayed access frequency (`client.stats`).
+
+- **Local VSS from Python**: deploy and elastically scale a router + peers with Docker (`mictlanx.vss`).
+
 - **Simple API & examples** to get productive fast.
 
 > MictlanX Client targets object storage use cases (store, fetch, list, and replicate objects).  

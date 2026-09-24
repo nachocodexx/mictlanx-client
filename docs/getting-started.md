@@ -446,6 +446,8 @@ python3 examples/client/02_get.py \
 
 ⚠️ ```--ball_id``` must match the logical id you used on PUT.
 
+`get()` does not cache by default. Pass `cache=True` (or create the client with `cache_default=True`) to keep the downloaded bytes in memory. The next `get()` then costs one metadata request instead of a download, as long as the stored checksum hasn't changed. `force=True` always downloads. See [Caching](api-reference/caching.md).
+
 #### 3. Put a file from disk
 
 Use `put_file` when the data lives on disk and you don't want to read the whole file into memory first.  The client streams it in chunks internally.
@@ -530,6 +532,59 @@ if del_result.is_ok:
 # Delete a specific chunk key
 del_key_result = await client.delete_by_key(key=f"{ball_id}_0", bucket_id=bucket_id)
 ```
+
+---
+
+### Bucket/Ball API
+
+`mictlanx.objects` is a small, exception-raising layer on top of `AsyncClient`. Instead of checking `Result` values, you work with `Bucket` and `Ball` handles, and errors are raised as [`MictlanXError`](api-reference/errors.md) subclasses. Reads always go through the cache, and every ball exposes this client's [access stats](api-reference/stats.md).
+
+```python
+from mictlanx import AsyncClient
+from mictlanx.objects import Bucket, BallConflictError
+
+async with AsyncClient(uri=URI) as mx:
+    bk   = mx.bucket("bk1")                 # or Bucket("bk1") inside the `async with`
+    ball = await bk.put("b1", b"hello", tags={"owner": "me"})   # -> Ball (metadata, no data)
+    data = await bk.get("b1")               # -> bytes (cached)
+    meta = await bk.get_metadata("b1")      # -> Ball
+
+    print(ball.num_gets, ball.hits, ball.misses, ball.freq)   # local, live stats
+    await ball.replicate(2)                 # replication = put the same data again
+
+    try:
+        await bk.put("b1", b"other data")   # balls are immutable
+    except BallConflictError:
+        ...
+
+    async for b in bk.balls():              # list the bucket
+        print(b.ball_id, b.size, b.tags)
+
+    result = await bk.put_many([("a", b"1"), ("b", b"2")])     # result.ok / result.failed
+```
+
+- `freq` is a decayed score: roughly the recent gets per second, halving every `half_life` (default `10m`) without reads. `num_gets` is the lifetime count.
+- Stats count only what this client did (puts and gets), are kept after cache eviction, and never touch the network.
+
+See `examples/new_api/` for runnable scripts and [Bucket & Ball](api-reference/objects.md) for the full reference.
+
+### Local VSS from Python
+
+Instead of `deploy_router.sh`, you can deploy a local VSS (router + summoner + rm + peers) straight from Python with `VirtualStorageSpace`. It needs a running Docker daemon and the `vss` extra (`pip install "mictlanx[vss]"`).
+
+```python
+from mictlanx import AsyncClient
+from mictlanx.vss import VirtualStorageSpace
+
+async with VirtualStorageSpace(peers=2) as vs:      # up() on enter, down() on exit
+    async with AsyncClient(uri=vs.uri) as mx:
+        await mx.bucket("bk1").put("b1", b"hello")
+
+    await vs.expand(n=2)     # add peers at runtime
+    await vs.retract(n=1)    # remove the most recently added peer
+```
+
+See `examples/vss/` and [Virtual Storage Space](api-reference/vss.md).
 
 ---
 

@@ -14,8 +14,10 @@ These variables configure an `AsyncClient` instance when the corresponding const
 | `MICTLANX_CLIENT_ID` | random hex | `client_id` — unique name for this instance; used as logger name and `producer_id`. |
 | `MICTLANX_CLIENT_DEBUG` | `1` | `debug` — when `1`, log records are echoed to the console. |
 | `MICTLANX_CLIENT_MAX_WORKERS` | `12` | `max_workers` — thread-pool upper bound (capped at `os.cpu_count()`). |
-| `MICTLANX_CLIENT_EVICTION_POLICY` | `LRU` | `eviction_policy` — in-memory cache strategy (`LRU` or `LFU`). |
+| `MICTLANX_CLIENT_EVICTION_POLICY` | `LFU` | `eviction_policy` — in-memory cache strategy (`LFU` with decay, or `LRU`). |
 | `MICTLANX_CLIENT_CAPACITY_STORAGE` | `1GB` | `capacity_storage` — cache size as a humanfriendly string (e.g. `512MB`, `2GB`). |
+| `MICTLANX_CLIENT_CACHE_DEFAULT` | `0` | `cache_default` — whether `get()` uses the cache when `cache=` is not given. `mictlanx.objects` handles always use it. |
+| `MICTLANX_CLIENT_HALF_LIFE` | `10m` | `half_life` — decay half-life of the access frequency (`client.stats`, LFU eviction), as a humanfriendly timespan. |
 | `MICTLANX_CLIENT_VERIFY` | `0` | `verify` — SSL certificate verification. `0` = off, `1` = system CAs. For a CA-bundle path or `SSLContext`, pass `verify=` directly in code. |
 
 ```bash

@@ -237,3 +237,22 @@ class BadParametersError(MictlanXError):
     """Exception raised when a function is called with invalid parameters."""
     def __init__(self, message = "Bad parameters",status_code:int = 400,error_code:int = 400):
         super().__init__(message, status_code, error_code)
+
+class DockerNotAvailableError(MictlanXError):
+    """Exception raised when the `docker` package (docker-py) is not installed."""
+    def __init__(self, message = "docker SDK not installed. Install with: pip install mictlanx[vss]",status_code:int = 500,error_code:int = 700):
+        super().__init__(message, status_code, error_code)
+
+class VSSNotDeployedError(MictlanXError):
+    """Exception raised when an operation requires a deployed VirtualStorageSpace but up() hasn't run yet."""
+    def __init__(self, message = "VirtualStorageSpace is not deployed",status_code:int = 409,error_code:int = 702):
+        super().__init__(message, status_code, error_code)
+class BallConflictError(MictlanXError):
+    """Exception raised when a put targets an existing ball with different data (balls are immutable)."""
+    def __init__(self, message = "Ball already exists with a different checksum",status_code:int = 409,error_code:int = 710):
+        super().__init__(message, status_code, error_code)
+
+class NoActiveClientError(MictlanXError):
+    """Exception raised when a Bucket handle is used without a client outside ``async with AsyncClient(...)``."""
+    def __init__(self, message = "No active AsyncClient: pass client= or use `async with AsyncClient(...)`",status_code:int = 500,error_code:int = 711):
+        super().__init__(message, status_code, error_code)

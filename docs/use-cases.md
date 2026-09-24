@@ -295,3 +295,52 @@ asyncio.run(consume())
 | Microservices sharing large payloads | Avoid embedding blobs in message queues; pass only the ball_id |
 | Cross-machine result handoff | Both sides connect to the same VSS; no direct link needed |
 | Checkpoint / resume | Write intermediate state with a fixed ball_id; consumer reads on restart |
+
+## Elastic scaling
+
+With `VirtualStorageSpace` you can grow and shrink a local VSS's peer pool while clients are connected. This is useful for testing how an application behaves when capacity changes, or for experiments on data placement and replication.
+
+### How it works
+
+1. `up()` deploys the router, summoner, rm and the initial peers.
+2. `expand(n)` (alias `elastic(n)`) summons `n` new peer containers, meshes them with the existing peers and registers them with the router.
+3. `retract(n)` removes the `n` most recently added peers (LIFO).
+4. `stats()` reports per-peer usage after each change.
+
+### Example
+
+```python
+import asyncio
+from mictlanx import AsyncClient
+from mictlanx.vss import VirtualStorageSpace
+
+async def main():
+    async with VirtualStorageSpace(peers=1, vss_id="elastic-demo") as vs:
+        async with AsyncClient(uri=vs.uri) as mx:
+            bk = mx.bucket("elastic")
+            await bk.put("before", b"x" * 1024)
+
+            res = await vs.expand(n=3)
+            print("new peers:", res.unwrap(), "size:", vs.size)
+
+            await bk.put("after", b"y" * 1024)   # the router can now place data on the new peers
+
+            stats = await vs.stats()
+            for peer_id, s in stats.unwrap().items():
+                print(peer_id, s.used_disk, "/", s.total_disk)
+
+            await vs.retract(n=2)
+            print("size after retract:", vs.size)
+
+asyncio.run(main())
+```
+
+The full version is in `examples/vss/02_elastic_scaling.py`. It requires Docker and `pip install "mictlanx[vss]"`.
+
+### When to use this
+
+| Scenario | Recommendation |
+|---|---|
+| Integration tests | Deploy a throwaway VSS per test session with `async with` so it is always cleaned up |
+| Capacity experiments | `expand()` during a workload and watch `stats()` |
+| Failure / churn testing | `retract()` peers and check your application's retries and reads |

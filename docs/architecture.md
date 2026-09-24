@@ -46,3 +46,16 @@ These VSS units are interconnected to form a single, unified storage fabric. Thi
 </div>
 
 
+
+## Client SDK layers
+
+The client SDK exposes the VSS at several levels of abstraction, each built on the one below:
+
+| Layer | Class | Use when |
+|---|---|---|
+| Objects | `Bucket` / `Ball` ([`mictlanx.objects`](api-reference/objects.md)) | Simple, exception-raising bucket/ball API with caching and local access stats |
+| High-level | [`AsyncClient`](api-reference/async-client.md) | Chunking, retries, load balancing across routers, caching, `Result` values |
+| Mid-level | [`AsyncRouter`](api-reference/router.md) | Router-managed access with peer selection and failover |
+| Low-level | [`AsyncPeer`](api-reference/peer.md) | Direct access to a single storage peer |
+
+For local development, [`VirtualStorageSpace`](api-reference/vss.md) deploys a complete VSS (router, summoner, rm and peers) with Docker and scales its peer pool at runtime.

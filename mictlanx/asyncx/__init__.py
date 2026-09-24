@@ -8,6 +8,7 @@ from uuid import uuid4
 import httpx
 import mictlanx.interfaces as InterfaceX
 from mictlanx.caching import CacheFactory
+from mictlanx.caching.stats import AccessStats
 import humanfriendly as HF
 from mictlanx.logger import Log
 from option import Ok, Some, Result, Err
@@ -25,6 +26,7 @@ from mictlanx.types import VerifyType
 from mictlanx.asyncx.bulk import _BulkJob
 from mictlanx.auth import AuthorizationService
 from mictlanx.filters import IOFilter
+from mictlanx.objects import Bucket
 
 try:
     from tqdm import tqdm
@@ -85,6 +87,8 @@ class AsyncClient():
             log_level: int | None = None,
             error_log: bool | None = None,
             authz: Optional[AuthorizationService] = None,
+            cache_default: bool | None = None,
+            half_life: str | None = None,
     ):
         """Initialise the client and connect it to one or more routers.
 
@@ -111,7 +115,7 @@ class AsyncClient():
                 ``Log``).
             eviction_policy: Cache eviction strategy — ``"LRU"`` or
                 ``"LFU"``. Defaults to the
-                ``MICTLANX_CLIENT_EVICTION_POLICY`` env var (``"LRU"``).
+                ``MICTLANX_CLIENT_EVICTION_POLICY`` env var (``"LFU"``).
             capacity_storage: Maximum cache size as a humanfriendly string
                 (e.g. ``"512MB"``, ``"2GB"``). Defaults to the
                 ``MICTLANX_CLIENT_CAPACITY_STORAGE`` env var (``"1GB"``).
@@ -133,6 +137,14 @@ class AsyncClient():
                 performed — current behaviour is unchanged. When set, the
                 client authenticates lazily on the first public method call
                 and re-verifies before every subsequent call.
+            cache_default: Whether :meth:`get` uses the in-memory cache when
+                its ``cache`` argument is not given. Defaults to the
+                ``MICTLANX_CLIENT_CACHE_DEFAULT`` env var (``0`` = off). The
+                :mod:`mictlanx.objects` handles always enable it.
+            half_life: Decay half-life of the access frequency used by
+                :attr:`stats` and LFU eviction, as a humanfriendly timespan
+                (e.g. ``"10m"``). Defaults to the ``MICTLANX_CLIENT_HALF_LIFE``
+                env var (``"10m"``).
         """
         _bool = lambda v: v.lower() in ("1", "true", "yes")
 
@@ -141,11 +153,16 @@ class AsyncClient():
         if client_id        is None: client_id        = os.environ.get("MICTLANX_CLIENT_ID")
         if debug            is None: debug            = _bool(os.environ.get("MICTLANX_CLIENT_DEBUG", "1"))
         if max_workers      is None: max_workers      = int(os.environ.get("MICTLANX_CLIENT_MAX_WORKERS", "12"))
-        if eviction_policy  is None: eviction_policy  = os.environ.get("MICTLANX_CLIENT_EVICTION_POLICY", "LRU")
+        if eviction_policy  is None: eviction_policy  = os.environ.get("MICTLANX_CLIENT_EVICTION_POLICY", "LFU")
         if capacity_storage is None: capacity_storage = os.environ.get("MICTLANX_CLIENT_CAPACITY_STORAGE", "1GB")
         if verify           is None: verify           = _bool(os.environ.get("MICTLANX_CLIENT_VERIFY", "0"))
         if error_log        is None: error_log        = _bool(os.environ.get("MICTLANX_LOG_ERROR_LOG", "1"))
-        self.cache     = CacheFactory.create(eviction_policy=eviction_policy, capacity_storage=HF.parse_size(capacity_storage))
+        if cache_default    is None: cache_default    = _bool(os.environ.get("MICTLANX_CLIENT_CACHE_DEFAULT", "0"))
+        if half_life        is None: half_life        = os.environ.get("MICTLANX_CLIENT_HALF_LIFE", "10m")
+        self.cache_default = cache_default
+        self.stats         = AccessStats(half_life_s=HF.parse_timespan(half_life))
+        self.cache         = CacheFactory.create(eviction_policy=eviction_policy, capacity_storage=HF.parse_size(capacity_storage), scorer=self.stats.rank)
+        self._ctx_tokens   = []
 
         self.client_id = client_id if client_id is not None else uuid4().hex
         # Peers
@@ -174,6 +191,29 @@ class AsyncClient():
         self.bulk_jobs_lock = asyncio.Lock()
         self.authz = authz
         self._auth_lock = asyncio.Lock()
+
+    async def __aenter__(self) -> "AsyncClient":
+        """Bind this client as the active one for :mod:`mictlanx.objects` handles.
+
+        Inside ``async with AsyncClient(...)``, ``Bucket("bk1")`` resolves to
+        this client without passing it explicitly.
+        """
+        from mictlanx.objects.context import _current_client
+        self._ctx_tokens.append(_current_client.set(self))
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        from mictlanx.objects.context import _current_client
+        if self._ctx_tokens:
+            _current_client.reset(self._ctx_tokens.pop())
+
+    def bucket(self, bucket_id: str) -> Bucket:
+        """Return a :class:`~mictlanx.objects.Bucket` handle bound to this client."""
+        return Bucket(bucket_id, client=self)
+
+    @staticmethod
+    def _now_ms() -> str:
+        return str(int(T.time() * 1000))
 
     async def _ensure_authenticated(self):
         """Authenticate ``self.authz`` if needed, or raise if that fails.
@@ -234,6 +274,7 @@ class AsyncClient():
             t1         = T.monotonic()
             _bucket_id = Utils.sanitize_str(bucket_id)
             _ball_id   = Utils.sanitize_str(ball_id)
+            updated_at = self._now_ms()
             router     = self.rlb.get_router()
             gen_bytes  = chunks.to_generator()
 
@@ -268,7 +309,7 @@ class AsyncClient():
                                 chunk=chunk,
                                 rf=rf,
                                 timeout=timeout,
-                                metadata={**tags, "num_chunks": str(num_chunks), "full_checksum": checksum},
+                                metadata={**tags, "num_chunks": str(num_chunks), "full_checksum": checksum, "updated_at": updated_at},
                             )
                         if res.is_ok:
                             self.__log.debug({
@@ -324,6 +365,7 @@ class AsyncClient():
                 "input": _input,
                 "context": {"num_chunks": num_chunks, "checksum": checksum, "size": size},
             })
+            self.stats.record_put(AccessStats.key(_bucket_id, _ball_id), nbytes=size)
             return Ok(True)
 
         except Exception as e:
@@ -384,6 +426,7 @@ class AsyncClient():
             t1          = T.monotonic()
             _bucket_id  = Utils.sanitize_str(bucket_id)
             _ball_id    = Utils.sanitize_str(ball_id)
+            updated_at = self._now_ms()
             router      = self.rlb.get_router()
             _chunk_size = HF.parse_size(chunk_size)
             (_, checksum, size) = XoloUtils.extract_path_sha256_size(path=path)
@@ -424,7 +467,7 @@ class AsyncClient():
                                 chunk=chunk,
                                 rf=rf,
                                 timeout=timeout,
-                                metadata={**tags, "num_chunks": str(num_chunks), "full_checksum": checksum},
+                                metadata={**tags, "num_chunks": str(num_chunks), "full_checksum": checksum, "updated_at": updated_at},
                             )
                         if res.is_ok:
                             self.__log.debug({
@@ -479,6 +522,7 @@ class AsyncClient():
                 "input": _input,
                 "context": {"num_chunks": num_chunks, "checksum": checksum, "size": size},
             })
+            self.stats.record_put(AccessStats.key(_bucket_id, _ball_id), nbytes=size)
             return Ok(True)
 
         except Exception as e:
@@ -510,7 +554,7 @@ class AsyncClient():
         
 
     @_require_auth
-    async def put(self, bucket_id: str, ball_id: str, value: bytes, chunk_size: str = "256kb", rf: int = 1, timeout: int = 120,max_tries:int = 5,max_concurrency:int =10,max_backoff:int=5,tags:Dict[str,str]={},filters:Optional[List[IOFilter]]=None)->Result[bool,EX.MictlanXError]:
+    async def put(self, bucket_id: str, ball_id: str, value: bytes, chunk_size: str = "256kb", rf: int = 1, timeout: int = 120,max_tries:int = 5,max_concurrency:int =10,max_backoff:int=5,tags:Dict[str,str]={},filters:Optional[List[IOFilter]]=None,cache:bool=False)->Result[bool,EX.MictlanXError]:
         """Upload raw bytes to a bucket by splitting them into chunks.
 
         Splits ``value`` into ``chunk_size`` chunks, computes a SHA-256
@@ -537,6 +581,9 @@ class AsyncClient():
                 computed from the filtered bytes; :meth:`get` must be given
                 the correctly-ordered inverse chain to recover the original
                 bytes.
+            cache: Also store ``value`` (the unfiltered bytes that :meth:`get`
+                returns) in the in-memory cache after a successful upload.
+                Defaults to ``False``.
 
         Returns:
             ``Ok(True)`` on success, ``Ok(False)`` when max-availability is
@@ -546,6 +593,7 @@ class AsyncClient():
             t1         = T.monotonic()
             _bucket_id = Utils.sanitize_str(bucket_id)
             _ball_id   = Utils.sanitize_str(ball_id)
+            original   = value
 
             _filters = filters or []
             for f in _filters:
@@ -562,6 +610,7 @@ class AsyncClient():
 
             chunks     = chunks_op.unwrap()
             num_chunks = len(chunks)
+            chunk_tags = {**tags, "num_chunks": str(num_chunks), "full_checksum": checksum, "mictlanx_filters": ",".join(f.name for f in _filters), "updated_at": self._now_ms()}
             semaphore  = asyncio.Semaphore(max_concurrency)
             progress_bar = tqdm(total=len(value))
             bytes_sent = 0
@@ -597,7 +646,7 @@ class AsyncClient():
                                 chunk      = chunk,
                                 rf         = rf,
                                 timeout    = timeout,
-                                metadata   = {**tags, "num_chunks": str(num_chunks), "full_checksum": checksum, "mictlanx_filters": ",".join(f.name for f in _filters)},
+                                metadata   = chunk_tags,
                                 chunk_size = "1MB",
                             )
                         if res.is_ok:
@@ -673,6 +722,19 @@ class AsyncClient():
                     "throughput_mbs": round(throughput, 3),
                 },
             })
+            key = AccessStats.key(_bucket_id, _ball_id)
+            self.stats.record_put(key, nbytes=len(value))
+            if cache:
+                self.cache.put(key, original, InterfaceX.Metadata(
+                    key          = f"{_ball_id}_0",
+                    size         = len(value),
+                    checksum     = checksum,
+                    tags         = {**chunk_tags, "index": "0", "mictlanx_get_filters": ",".join(reversed([f.name for f in _filters]))},
+                    content_type = "application/octet-stream",
+                    producer_id  = self.client_id,
+                    ball_id      = _ball_id,
+                    bucket_id    = _bucket_id,
+                ))
             return Ok(True)
 
         except Exception as e:
@@ -784,6 +846,7 @@ class AsyncClient():
             t1           = T.monotonic()
             _bucket_id   = Utils.sanitize_str(bucket_id)
             _ball_id     = Utils.sanitize_str(ball_id)
+            updated_at = self._now_ms()
             router       = self.rlb.get_router()
             semaphore    = asyncio.Semaphore(max_concurrency)
             progress_bar = tqdm(total=chunk.size)
@@ -819,7 +882,7 @@ class AsyncClient():
                                 chunk=chunk,
                                 rf=rf,
                                 timeout=timeout,
-                                metadata={**tags},
+                                metadata={**tags, "updated_at": updated_at},
                                 chunk_size="1MB",
                             )
                         if res.is_ok:
@@ -1628,7 +1691,8 @@ class AsyncClient():
         chunk_index:int = 0,
         max_delay:int =30,
         jitter:bool = True,
-        filters:Optional[List[IOFilter]] = None
+        filters:Optional[List[IOFilter]] = None,
+        cache:Optional[bool] = None,
     )->Result[InterfaceX.AsyncGetResponse, EX.MictlanXError]:
         """Download all chunks of a ball and reassemble them into bytes.
 
@@ -1664,6 +1728,11 @@ class AsyncClient():
                 the chain given to :meth:`put` (e.g. ``put(filters=[a, b])``
                 pairs with ``get(filters=[b_inverse, a_inverse])``). Defaults
                 to ``None`` (no filters — identical to today's behavior).
+            cache: Serve from / store into the in-memory cache. ``None``
+                (default) uses the client's ``cache_default``. A cached copy
+                is only served when its checksum matches the fresh metadata
+                and it was produced with the same ``filters``; ``force=True``
+                always downloads.
 
         Returns:
             ``Ok(AsyncGetResponse)`` whose ``data`` field is a
@@ -1726,6 +1795,28 @@ class AsyncClient():
                 num_chunks = int(metadata.metadata.tags.get("num_chunks"))
                 if num_chunks <= 0:
                     raise EX.ValidationError(message=f"No valid number of chunks: {num_chunks}")
+
+                cache_key       = AccessStats.key(_bucket_id, _ball_id)
+                use_cache       = self.cache_default if cache is None else cache
+                get_filter_tag  = ",".join(f.name for f in (filters or []))
+                if use_cache and not force:
+                    cached = self.cache.get(cache_key)
+                    if cached.is_some:
+                        cached_meta, cached_data = cached.unwrap()
+                        fresh_checksum = metadata.metadata.tags.get("full_checksum", "")
+                        if fresh_checksum and cached_meta.tags.get("full_checksum") == fresh_checksum and cached_meta.tags.get("mictlanx_get_filters", "") == get_filter_tag:
+                            self.stats.record_get(cache_key, hit=True, nbytes=cached_data.nbytes)
+                            self.__log.debug({
+                                "event": "GET.CACHE.HIT",
+                                "message": "served from cache",
+                                "bucket_id": _bucket_id,
+                                "ball_id": _ball_id,
+                                "response_time_ms": round((T.monotonic() - t1) * 1000, 2),
+                                "input": _input,
+                                "context": {"checksum": fresh_checksum, "size": cached_data.nbytes},
+                            })
+                            return Ok(InterfaceX.AsyncGetResponse(data=cached_data, metadatas=[cached_meta]))
+                        self.cache.remove(cache_key)
 
                 pbar = tqdm(total=num_chunks)
                 async with httpx.AsyncClient(http2=http2, trust_env=False, timeout=timeout, verify=self.verify, headers=headers) as client:
@@ -1803,7 +1894,7 @@ class AsyncClient():
                 pbar.close()
                 remote_checksum = responses[0][0].tags.get("full_checksum", "")
                 x        = await AsyncClientUtils.merge_chunks(chunks=responses)
-                checksum = XoloUtils.sha256(x.tobytes())
+                checksum = XoloUtils.sha256(x)
                 if not remote_checksum == checksum:
                     self.__log.warning({
                         "event": "INTEGRITY.CHECK.FAILED",
@@ -1861,6 +1952,10 @@ class AsyncClient():
                             return Err(EX.FilterExecutionError(f"{f.name} filter raised {type(e).__name__}: {e}"))
                     x = memoryview(data)
 
+                self.stats.record_get(cache_key, hit=False, nbytes=x.nbytes)
+                if use_cache:
+                    first = responses[0][0]
+                    self.cache.put(cache_key, x, first.model_copy(update={"tags": {**first.tags, "mictlanx_get_filters": get_filter_tag}}))
                 return Ok(InterfaceX.AsyncGetResponse(data=x, metadatas=metadatas))
 
             raise EX.MictlanXError.from_exception(metadata_result.unwrap_err())
@@ -2189,7 +2284,8 @@ class AsyncClient():
             b.build()
             return Ok(b)
         except Exception as e:
-            _e = EX.MictlanXError.from_exception(e)
+            # Keep already-typed errors (e.g. NotFoundError) instead of collapsing them into UnknownError.
+            _e = e if isinstance(e, EX.MictlanXError) else EX.MictlanXError.from_exception(e)
             self.__log.error({
                 "event": "GET.METADATA.BY.BALL.ID.ERROR",
                 "message": _e.message,
@@ -2342,6 +2438,7 @@ class AsyncClient():
             headers["Accept-Encoding"] = headers.get("Accept-Encoding", "identity")
             router     = self.rlb.get_router()
             _input     = {"bucket_id": bucket_id, "ball_id": ball_id, "key": ball_id, "timeout": timeout, "force": force}
+            self.cache.remove(AccessStats.key(_bucket_id, _ball_id))
 
             ball_metadata_result = await router.get_chunks_metadata(bucket_id=_bucket_id, ball_id=_ball_id, timeout=timeout, headers=headers)
             if ball_metadata_result.is_err:
@@ -2467,6 +2564,9 @@ class AsyncClient():
             or an Err with an Exception on failure.
         """
         try: 
+            prefix = AccessStats.key(Utils.sanitize_str(bucket_id), "")
+            for k in [k for k in self.cache.get_keys() if k.startswith(prefix)]:
+                self.cache.remove(k)
             start_time = T.time()
             deleted = 0
             failed = 0
