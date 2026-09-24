@@ -4,6 +4,7 @@ import time as T
 from datetime import datetime
 import asyncio
 import functools
+import inspect
 from uuid import uuid4
 import httpx
 import mictlanx.interfaces as InterfaceX
@@ -47,17 +48,34 @@ def _require_auth(fn):
     Otherwise it calls :meth:`AsyncClient._ensure_authenticated` first; a
     failure there short-circuits the call and returns ``Err(...)`` without
     ever invoking ``fn``.
+
+    Async generators (e.g. :meth:`AsyncClient.get_chunks`) are wrapped as
+    async generators so ``async for`` keeps working; since a generator cannot
+    return ``Err``, an auth failure is raised instead.
     """
+    def _as_mictlanx_error(e: Exception) -> EX.MictlanXError:
+        # Preserve the original error type (e.g. AuthenticationError) —
+        # from_exception() only maps by error_code and would otherwise
+        # collapse an already-typed MictlanXError into UnknownError.
+        return e if isinstance(e, EX.MictlanXError) else EX.MictlanXError.from_exception(e)
+
+    if inspect.isasyncgenfunction(fn):
+        @functools.wraps(fn)
+        async def gen_wrapper(self: "AsyncClient", *args, **kwargs):
+            try:
+                await self._ensure_authenticated()
+            except Exception as e:
+                raise _as_mictlanx_error(e)
+            async for item in fn(self, *args, **kwargs):
+                yield item
+        return gen_wrapper
+
     @functools.wraps(fn)
     async def wrapper(self: "AsyncClient", *args, **kwargs):
         try:
             await self._ensure_authenticated()
         except Exception as e:
-            # Preserve the original error type (e.g. AuthenticationError) —
-            # from_exception() only maps by error_code and would otherwise
-            # collapse an already-typed MictlanXError into UnknownError.
-            _e = e if isinstance(e, EX.MictlanXError) else EX.MictlanXError.from_exception(e)
-            return Err(_e)
+            return Err(_as_mictlanx_error(e))
         return await fn(self, *args, **kwargs)
     return wrapper
 
